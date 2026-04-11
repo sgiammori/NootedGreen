@@ -45,7 +45,7 @@ NootedGreen adds:
 
 ## Building
 
-Open `NootedBlue.xcodeproj`, select the **NootedGreen** scheme, and build with Xcode.
+Open `NootedBlue.xcodeproj` and select the **NootedGreen** scheme to build the RPL-P plugin, or one of the original NootedBlue schemes for legacy hardware. Build with Xcode.
 
 ## License
 
