@@ -261,6 +261,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN19AppleIntelPowerWell20disableDisplayEngineEv",disableDisplayEngine, this->odisableDisplayEngine},
 			{"__ZN19AppleIntelPowerWell19enableDisplayEngineEv",enableDisplayEngine, this->oenableDisplayEngine},
 			{"__ZN17AppleIntelPortHAL14enableComboPhyEv",enableComboPhyEv, this->oenableComboPhyEv},
+			{"__ZN14AppleIntelPort16computeLaneCountEPK29IODetailedTimingInformationV2jjPj",computeLaneCount, this->ocomputeLaneCount},
 			{"__ZN19AppleIntelPowerWell21hwSetPowerWellStatePGEbj", releaseDoorbell},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateAuxEbj",hwSetPowerWellStateAux, this->ohwSetPowerWellStateAux},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateDDIEbj",hwSetPowerWellStateDDI, this->ohwSetPowerWellStateDDI},
@@ -2572,13 +2573,24 @@ uint8_t Gen11::hwRegsNeedUpdate
 		   void *param_2,void *param_3,void *param_4,
 		   void *param_5)
 {
-	// Call the original so it sets internal flags/state that setDisplayMode checks
-	// to decide whether to run "Disabling black black" (lift black screen overlay).
-	// Without calling original, the flag is never set and the display stays black.
-	// But return 0 regardless to prevent register reprogramming (TRANS_DDI_FUNC_CTL
-	// lane count 4→2, TRANS_CONF, DP M/N) that kills the boot display.
-	FunctionCast(hwRegsNeedUpdate, callback->ohwRegsNeedUpdate)(that, param_1, param_2, param_3, param_4, param_5);
-	return 0;
+	// Return the original result so that register reprogramming proceeds normally.
+	// The lane count mismatch (4→2) that previously broke the display is now fixed
+	// by the computeLaneCount hook forcing 4 lanes.  Without register updates, the
+	// plane surface address and stride never get written, leaving the stale BIOS
+	// framebuffer on screen (grey/black vertical bars with only cursor visible).
+	return FunctionCast(hwRegsNeedUpdate, callback->ohwRegsNeedUpdate)(that, param_1, param_2, param_3, param_4, param_5);
+}
+
+void Gen11::computeLaneCount(void *that, const void *timing, unsigned int linkRate, unsigned int bpp, unsigned int *laneCount) {
+	FunctionCast(computeLaneCount, callback->ocomputeLaneCount)(that, timing, linkRate, bpp, laneCount);
+	// BIOS trains the eDP link at 4 lanes (HBR3 x4).  The driver correctly computes
+	// that 2 lanes suffice for 285.6 MHz @ 24 bpp, but writing 2 into DDI_FUNC_CTL
+	// without link retraining causes a PHY/transcoder lane count mismatch.
+	// Force 4 lanes to match the BIOS-trained link configuration.
+	if (laneCount && *laneCount < 4) {
+		DBGLOG("ngreen", "computeLaneCount: forcing lane count from %u to 4", *laneCount);
+		*laneCount = 4;
+	}
 }
 
 long blti=0;
