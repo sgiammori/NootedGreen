@@ -192,16 +192,76 @@ void NGreen::setRMMIOIfNecessary() {
 
 bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	if (kextIOAcceleratorFamily2.loadIndex == index) {
+		SYSLOG("NGreen", "IOAccelF2: TEXT 0x%llx size 0x%lx", address, size);
 		
-		static const uint8_t f1[]= {0x74, 0x57, 0x45, 0x8b, 0x8f, 0x84, 0x02, 0x00, 0x00, 0x48, 0x8d, 0x3d, 0x4a, 0x47, 0xfb, 0xff};
-		static const uint8_t r1[]= {0xeb, 0x57, 0x45, 0x8b, 0x8f, 0x84, 0x02, 0x00, 0x00, 0x48, 0x8d, 0x3d, 0x4a, 0x47, 0xfb, 0xff};
-		const LookupPatchPlus patch {&kextIOAcceleratorFamily2, f1, r1, 1};
-		SYSLOG_COND(!patch.apply(patcher, address, size), "NGreen", "Failed to apply kextIOAcceleratorFamily2 patch f1");
-
-		static const uint8_t f2[]= {0x48, 0x83, 0xec, 0x18, 0xf7, 0xc2, 0xc0, 0x73, 0x80, 0xff, 0x74, 0x33};
-		static const uint8_t r2[]= {0x48, 0x83, 0xec, 0x18, 0xf7, 0xc2, 0xc0, 0x73, 0x80, 0xff, 0xeb, 0x33};
-		const LookupPatchPlus patch2 {&kextIOAcceleratorFamily2, f2, r2, 1};
-		SYSLOG_COND(!patch2.apply(patcher, address, size), "NGreen", "Failed to apply kextIOAcceleratorFamily2 patch f2");
+		// V35: Use masked patterns for version-independent matching.
+		// The original f1/f2 had hard-coded RIP-relative offsets and test immediates
+		// that change between macOS builds.  Masked find/replace wildcards those bytes.
+		
+		// ── f1: je → jmp before mov r9d,[r15+OFFSET]; REX-prefixed instr ──
+		// Original (pre-Sonoma): je +0x57; mov r9d,[r15+0x284]; lea rdi,[rip+...]
+		// Anchor: 45 8b 8f = mov r9d,[r15+disp32]  (REX.RB, MOV, ModRM)
+		// Only byte changed: je (0x74) → jmp (0xEB)
+		static const uint8_t f1_f[]  = {0x74, 0x00, 0x45, 0x8b, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x48};
+		static const uint8_t f1_m[]  = {0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF};
+		static const uint8_t f1_r[]  = {0xEB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+		static const uint8_t f1_rm[] = {0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+		const LookupPatchPlus p1 {&kextIOAcceleratorFamily2, f1_f, f1_m, f1_r, f1_rm, 1};
+		bool f1ok = p1.apply(patcher, address, size);
+		patcher.clearError();
+		SYSLOG("NGreen", "IOAccelF2 f1 (masked): %s", f1ok ? "OK" : "FAILED");
+		
+		// ── f2: je → jmp after sub rsp,imm8; test edx,imm32 ──
+		// Original: sub rsp,0x18; test edx,0xFF8073C0; je +0x33
+		// Anchor: 48 83 ec = sub rsp,imm8  followed by  f7 c2 = test edx,imm32
+		// Only byte changed: je (0x74) → jmp (0xEB)
+		static const uint8_t f2_f[]  = {0x48, 0x83, 0xec, 0x00, 0xf7, 0xc2, 0x00, 0x00, 0x00, 0x00, 0x74, 0x00};
+		static const uint8_t f2_m[]  = {0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00};
+		static const uint8_t f2_r[]  = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xEB, 0x00};
+		static const uint8_t f2_rm[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00};
+		const LookupPatchPlus p2 {&kextIOAcceleratorFamily2, f2_f, f2_m, f2_r, f2_rm, 1};
+		bool f2ok = p2.apply(patcher, address, size);
+		patcher.clearError();
+		SYSLOG("NGreen", "IOAccelF2 f2 (masked): %s", f2ok ? "OK" : "FAILED");
+		
+		// ── Fallback: scan binary for anchors and log context ──
+		if (!f1ok || !f2ok) {
+			const uint8_t *bin = reinterpret_cast<const uint8_t *>(address);
+			
+			if (!f1ok) {
+				int n = 0;
+				// Look for mov r9d,[r15+disp32] preceded by je or jne
+				for (size_t i = 2; i + 16 < size && n < 5; i++) {
+					if ((bin[i] == 0x45 || bin[i] == 0x44) &&
+					    bin[i+1] == 0x8b && bin[i+2] == 0x8f &&
+					    (bin[i-2] == 0x74 || bin[i-2] == 0x75)) {
+						SYSLOG("NGreen", "f1 SCAN +0x%lx: %02x%02x %02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x",
+							i-2, bin[i-2], bin[i-1],
+							bin[i], bin[i+1], bin[i+2], bin[i+3], bin[i+4], bin[i+5], bin[i+6],
+							bin[i+7], bin[i+8], bin[i+9], bin[i+10]);
+						n++;
+					}
+				}
+				if (!n) SYSLOG("NGreen", "f1 SCAN: no je/jne before mov r?d,[r15+disp32] found");
+			}
+			
+			if (!f2ok) {
+				int n = 0;
+				// Look for sub rsp,XX; test edx,imm32; je/jne
+				for (size_t i = 0; i + 12 < size && n < 5; i++) {
+					if (bin[i] == 0x48 && bin[i+1] == 0x83 && bin[i+2] == 0xec &&
+					    bin[i+4] == 0xf7 && bin[i+5] == 0xc2 &&
+					    (bin[i+10] == 0x74 || bin[i+10] == 0x75)) {
+						SYSLOG("NGreen", "f2 SCAN +0x%lx: %02x%02x%02x%02x %02x%02x%02x%02x%02x%02x %02x%02x",
+							i, bin[i], bin[i+1], bin[i+2], bin[i+3],
+							bin[i+4], bin[i+5], bin[i+6], bin[i+7], bin[i+8], bin[i+9],
+							bin[i+10], bin[i+11]);
+						n++;
+					}
+				}
+				if (!n) SYSLOG("NGreen", "f2 SCAN: no sub rsp; test edx; je/jne found");
+			}
+		}
 		
 	}  else if (kextIOGraphics.loadIndex == index) {
 		/*
