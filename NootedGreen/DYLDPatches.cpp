@@ -129,8 +129,8 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			//{f4, r4, "f4"},
 			
 			{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-			//{f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma)"},
-			//{f_skippresent_sonoma, r_skippresent_sonoma, "Display::Present skip (Sonoma)"},
+			{f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma)"},
+			{f_skippresent_sonoma, r_skippresent_sonoma, "Display::Present skip (Sonoma)"},
 			{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
 			{f_skipac_sonoma, r_skipac_sonoma, "AccessComplete skip (Sonoma)"},
 
