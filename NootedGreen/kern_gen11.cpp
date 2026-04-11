@@ -2473,7 +2473,7 @@ void Gen11::hwSetPowerWellStateAux(void *that,bool param_1,uint param_2)
 
 void Gen11::hwInitializeCState(void *that)
 {
-	SYSLOG("ngreen", "NB-BUILD-V38-COMBOPHY-SKIP-UNCONDITIONAL");
+	SYSLOG("ngreen", "NB-BUILD-V39-PARTIAL-MATCH-DIAG");
 	int origB48 = getMember<int>(that, 0xB48);
 	int origCE4 = getMember<int>(that, 0xCE4);
 	SYSLOG("ngreen", "hwInitCState B48=%d CE4=%d", origB48, origCE4);
