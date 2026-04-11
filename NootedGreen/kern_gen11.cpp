@@ -562,8 +562,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		//last	 {"__ZN11IGScheduler15canLoadFirmwareEP16IntelAccelerator", canLoadFirmware, this->ocanLoadFirmware},
 			 // V36: Hook readAndClearInterrupts to initialize Gen11 multi-engine GT interrupts.
 			 // Same implementation as TGL path — Gen11 IRQ registers are identical for ICL/TGL.
-			 // wrapWriteRegister32 handles framecont==NULL via rmmio fallback.
-			 {"__ZN16IntelAccelerator23readAndClearInterruptsEPv", readAndClearInterrupts, this->oreadAndClearInterrupts},
+			 // V37: DISABLED — caused boot hang on TGL path; disabling ICL too for safety.
+			 // {"__ZN16IntelAccelerator23readAndClearInterruptsEPv", readAndClearInterrupts, this->oreadAndClearInterrupts},
 		 };
 
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route dp symbols");
@@ -662,7 +662,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			 // V36: Hook readAndClearInterrupts to initialize Gen11 multi-engine GT interrupts.
 			 // Without this, RCS/BCS user interrupts and context-switch notifications may not
 			 // be properly enabled, preventing IOAccelF2 from seeing stamp completions.
-			 {"__ZN16IntelAccelerator23readAndClearInterruptsEPv", readAndClearInterrupts, this->oreadAndClearInterrupts},
+			 // V37: DISABLED — caused boot hang (symbol may not exist in TGL kext, or
+			 // interrupt reprogramming too early causes deadlock/panic).
+			 // {"__ZN16IntelAccelerator23readAndClearInterruptsEPv", readAndClearInterrupts, this->oreadAndClearInterrupts},
 
 			// {"__ZN11IGAccelTask16getBlit3DContextEb", getBlit3DContext, this->ogetBlit3DContext},
 		
@@ -2471,7 +2473,7 @@ void Gen11::hwSetPowerWellStateAux(void *that,bool param_1,uint param_2)
 
 void Gen11::hwInitializeCState(void *that)
 {
-	SYSLOG("ngreen", "NB-BUILD-V36-COMBOPHY-SKIP-UNCONDITIONAL");
+	SYSLOG("ngreen", "NB-BUILD-V37-COMBOPHY-SKIP-UNCONDITIONAL");
 	int origB48 = getMember<int>(that, 0xB48);
 	int origCE4 = getMember<int>(that, 0xCE4);
 	SYSLOG("ngreen", "hwInitCState B48=%d CE4=%d", origB48, origCE4);
