@@ -2187,6 +2187,7 @@ bool Gen11::AppleIntelBaseControllerstart(void *that,void *param_1)
 }
 
 
+/*
 void Gen11::initCDClock(void *that)
 {
 	// Mirrors AppleIntelFramebufferController::initCDClock decompiled flow.
@@ -2219,11 +2220,11 @@ void Gen11::initCDClock(void *that)
 
 	getMember<uint64_t>(that, 0xe90) = probedFreq;
 }
-/*
+*/
 void Gen11::initCDClock(void *that)
 {
-	return FunctionCast(initCDClock, callback->oinitCDClock)(that );
-}*/
+	return FunctionCast(initCDClock, callback->oinitCDClock)(that);
+}
 
 void Gen11::setCDClockFrequencyOnHotplug(void *that)
 {
