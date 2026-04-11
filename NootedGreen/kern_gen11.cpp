@@ -560,6 +560,10 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			 {"__ZN13IGHardwareGuC13loadGuCBinaryEv", loadGuCBinary, this->oloadGuCBinary},
 		//last	 {"__ZN13IGHardwareGuC18checkWOPCMSettingsEmR14IOVirtualRange", checkWOPCMSettings, this->ocheckWOPCMSettings},
 		//last	 {"__ZN11IGScheduler15canLoadFirmwareEP16IntelAccelerator", canLoadFirmware, this->ocanLoadFirmware},
+			 // V36: Hook readAndClearInterrupts to initialize Gen11 multi-engine GT interrupts.
+			 // Same implementation as TGL path — Gen11 IRQ registers are identical for ICL/TGL.
+			 // wrapWriteRegister32 handles framecont==NULL via rmmio fallback.
+			 {"__ZN16IntelAccelerator23readAndClearInterruptsEPv", readAndClearInterrupts, this->oreadAndClearInterrupts},
 		 };
 
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route dp symbols");
@@ -654,6 +658,11 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			 // This tells the accelerator to use our hooked SafeForceWakeMultithreaded instead of
 			 // the framebuffer's SafeForceWake (which fails on RPL-P with ForceWake ACK=0).
 			 {"__ZN16IntelAccelerator5startEP9IOService", start, this->ostart},
+
+			 // V36: Hook readAndClearInterrupts to initialize Gen11 multi-engine GT interrupts.
+			 // Without this, RCS/BCS user interrupts and context-switch notifications may not
+			 // be properly enabled, preventing IOAccelF2 from seeing stamp completions.
+			 {"__ZN16IntelAccelerator23readAndClearInterruptsEPv", readAndClearInterrupts, this->oreadAndClearInterrupts},
 
 			// {"__ZN11IGAccelTask16getBlit3DContextEb", getBlit3DContext, this->ogetBlit3DContext},
 		
@@ -1543,6 +1552,17 @@ bool Gen11::start(void *that,void  *param_1)
 		NGreen::callback->readReg32(RING_EXECLIST_STATUS(BLT_RING_BASE)),
 		NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(BLT_RING_BASE)));
 	
+	// V36: Dump interrupt enable/mask state to verify GT interrupts are configured
+	SYSLOG("ngreen", "IRQ: GFX_MSTR_IRQ=0x%x DISPLAY_INT_CTL=0x%x",
+		NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ),
+		NGreen::callback->readReg32(GEN11_DISPLAY_INT_CTL));
+	SYSLOG("ngreen", "IRQ: RENDER_COPY_INTR_EN=0x%x VCS_VECS_INTR_EN=0x%x",
+		NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE),
+		NGreen::callback->readReg32(GEN11_VCS_VECS_INTR_ENABLE));
+	SYSLOG("ngreen", "IRQ: RCS0_RSVD_MASK=0x%x BCS_RSVD_MASK=0x%x",
+		NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK),
+		NGreen::callback->readReg32(GEN11_BCS_RSVD_INTR_MASK));
+	
 	// Release both ForceWake domains
 	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 0);
 	NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 0);
@@ -1823,6 +1843,7 @@ void  Gen11::readAndClearInterrupts(void *that,void *param_1)
 	
 	if (iniin){
 		iniin=0;
+		SYSLOG("ngreen", "readAndClearInterrupts: first call — initializing Gen11 GT interrupts");
 		
 		wrapWriteRegister32(callback->framecont, GEN11_GFX_MSTR_IRQ, 0);
 		wrapWriteRegister32(callback->framecont,GEN11_DISPLAY_INT_CTL, 0);
@@ -2450,7 +2471,7 @@ void Gen11::hwSetPowerWellStateAux(void *that,bool param_1,uint param_2)
 
 void Gen11::hwInitializeCState(void *that)
 {
-	SYSLOG("ngreen", "NB-BUILD-V33-COMBOPHY-SKIP-UNCONDITIONAL");
+	SYSLOG("ngreen", "NB-BUILD-V36-COMBOPHY-SKIP-UNCONDITIONAL");
 	int origB48 = getMember<int>(that, 0xB48);
 	int origCE4 = getMember<int>(that, 0xCE4);
 	SYSLOG("ngreen", "hwInitCState B48=%d CE4=%d", origB48, origCE4);
