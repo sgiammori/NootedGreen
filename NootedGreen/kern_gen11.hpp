@@ -1336,6 +1336,8 @@ private:
 	mach_vm_address_t ohwInitializeCState {};
 
 	bool isICLFB {false};   // true when loaded under AppleIntelICLLPGraphicsFramebuffer
+	bool tglFBLoaded {false};  // true when TGL FB processed — skip ICL FB if set
+	bool tglHWLoaded {false};  // true when TGL HW processed — skip ICL HW if set
 
 	static void hwConfigureCustomAUX(void *that,bool param_1);
 	mach_vm_address_t ohwConfigureCustomAUX {};
