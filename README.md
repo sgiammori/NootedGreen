@@ -8,7 +8,7 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 
 ## Status
 
-**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises. Display pipeline under active development.
+**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises, host-based scheduler (type 5) active with RCS ring running. Display pipeline working (eDP trained, cursor visible). GPU acceleration under active development — IOAccelF2 patches applied, full personality injected, userspace driver bundles staged.
 
 ## Requirements
 
@@ -26,7 +26,8 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 | Arg | Purpose |
 |---|---|
 | `-NGreenDebug` | Enable NootedGreen debug logging |
-| `-disablegfxfirmware` | Disable GuC/HuC firmware loading |
+| `-disablegfxfirmware` | Disable GuC/HuC firmware loading (legacy, prefer `ngreenSched`) |
+| `ngreenSched=N` | Select GPU scheduler type: `3` = GuC firmware, `4` = IGScheduler4, `5` = host preemptive (default: `5`) |
 | `-nbdyldoff` | Disable DYLD patches |
 | `ngreen-dmc=skip` | Skip DMC firmware |
 | `-allow3d` | Force 3D acceleration |
@@ -35,6 +36,38 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 | `-wegdbg` | Enable WhateverGreen debug logging |
 | `-liludbg` | Enable Lilu debug logging |
 | `liludump=60` | Dump Lilu logs after 60 seconds |
+
+## GPU Scheduler
+
+The Intel TGL graphics driver supports three scheduler types, selectable at boot:
+
+| Type | Name | Description |
+|------|------|-------------|
+| 3 | **GuC firmware** | Default Apple scheduler — loads GuC binary firmware. Requires matching firmware blobs. |
+| 4 | **IGScheduler4** | Intermediate scheduler. |
+| 5 | **Host preemptive** | Host-based scheduler — no firmware required. Ring command streamer managed by the driver. **Recommended for unsupported hardware.** |
+
+**Selection priority:**
+
+1. Boot argument `ngreenSched=N` (highest priority)
+2. `SchedulerType` key in Info.plist (NootedGreen personality)
+3. Default: `5` (host preemptive)
+
+Type 5 bypasses `IGScheduler::initFirmware()` entirely, avoiding GuC/HuC binary loading which fails on spoofed devices. The RCS ring is initialized directly by the host driver.
+
+### Required GPU driver bundles
+
+For GPU acceleration, the following userspace driver bundles must be installed in `/Library/Extensions/`:
+
+| Bundle | Purpose |
+|--------|---------|
+| `AppleIntelTGLGraphicsMTLDriver.bundle` | Metal driver |
+| `AppleIntelTGLGraphicsGLDriver.bundle` | OpenGL driver |
+| `AppleIntelTGLGraphicsVADriver.bundle` | Video Acceleration driver |
+| `AppleIntelTGLGraphicsVAME.bundle` | VA Media Engine |
+| `AppleIntelGraphicsShared.bundle` | Shared graphics library |
+
+These bundles are loaded by name (via `MetalPluginName`, `IOGLBundleName`, etc.), not by `CFBundleIdentifier`. They are not shipped with NootedGreen and must be sourced separately.
 
 ## Compatibility
 

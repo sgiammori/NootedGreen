@@ -1301,10 +1301,48 @@ uint32_t Gen11::wrapProbeCDClockFrequency(void *that) {
 
 bool Gen11::start(void *that,void  *param_1)
 {
+	// V44: Configurable scheduler type.
+	// populateAccelConfig reads "GraphicsSchedulerSelect" from the IORegistry.
+	// Types: 3=IGGuC (firmware), 4=IGScheduler4, 5=IGScheduler5 (host preemptive).
+	// Priority: boot-arg "ngreenSched=N" > Info.plist "SchedulerType" > default 5.
+	auto *service = static_cast<IOService *>(that);
+	{
+		int schedType = 5; // default: host preemptive (no firmware needed)
+		
+		// 1. Check boot-arg first (highest priority)
+		int bootArgSched = 0;
+		if (PE_parse_boot_argn("ngreenSched", &bootArgSched, sizeof(bootArgSched)) && bootArgSched >= 3 && bootArgSched <= 5) {
+			schedType = bootArgSched;
+			SYSLOG("ngreen", "V44: scheduler type %d from boot-arg ngreenSched", schedType);
+		} else {
+			// 2. Check NootedGreen's own IORegistry properties (from Info.plist)
+			auto *myService = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(param_1));
+			if (myService) {
+				auto *stProp = OSDynamicCast(OSNumber, myService->getProperty("SchedulerType"));
+				if (stProp) {
+					int val = (int)stProp->unsigned32BitValue();
+					if (val >= 3 && val <= 5) {
+						schedType = val;
+						SYSLOG("ngreen", "V44: scheduler type %d from Info.plist SchedulerType", schedType);
+					}
+				}
+			}
+			if (schedType == 5) {
+				SYSLOG("ngreen", "V44: using default scheduler type 5 (host preemptive)");
+			}
+		}
+		
+		auto *schedNum = OSNumber::withNumber(static_cast<unsigned long long>(schedType), 32);
+		if (schedNum) {
+			service->setProperty("GraphicsSchedulerSelect", schedNum);
+			schedNum->release();
+			SYSLOG("ngreen", "V44: injected GraphicsSchedulerSelect=%d", schedType);
+		}
+	}
+
 	// Inject MultiForceWakeSelect=1 into Development dictionary.
 	// This tells the accelerator to use SafeForceWakeMultithreaded (which we hook)
 	// instead of the framebuffer's SafeForceWake (which fails on RPL-P with ACK=0).
-	auto *service = static_cast<IOService *>(that);
 	auto *devDict = OSDynamicCast(OSDictionary, service->getProperty("Development"));
 	if (devDict) {
 		auto *newDevDict = OSDictionary::withDictionary(devDict);
@@ -1447,6 +1485,48 @@ bool Gen11::start(void *that,void  *param_1)
 	IODelay(1000);
 	
 	SYSLOG("ngreen", "start() returned %d", ret);
+	
+	// V43: Scheduler type diagnostic — read field_1190 bits 23-25
+	{
+		uint64_t caps1190 = getMember<uint64_t>(that, 0x1190);
+		uint32_t schedType = (caps1190 >> 23) & 7;
+		uint32_t devType1120 = getMember<uint32_t>(that, 0x1120);
+		SYSLOG("ngreen", "V43: field_1190=0x%llx schedType=%u (3=GuC,4=Sched4,5=Host) devType_1120=%u",
+			   (unsigned long long)caps1190, schedType, devType1120);
+		
+		// Read encodeFailureStack entries (offsets 0x1c30-0x1c4c, count at 0x1c50)
+		uint32_t failCount = getMember<uint32_t>(that, 0x1c50);
+		SYSLOG("ngreen", "V43: encodeFailureStack count=%u", failCount);
+		for (uint32_t i = 0; i < failCount && i < 8; i++) {
+			uint32_t code = getMember<uint32_t>(that, 0x1c30 + i * 4);
+			SYSLOG("ngreen", "V43:   failureStack[%u] = 0x%x", i, code);
+		}
+		
+		// Read the scheduler pointer — check if scheduler was actually created
+		// From start() disassembly, the scheduler is stored via virtual call;
+		// try reading field at 0xe00 (common IOAccelF2 scheduler offset)
+		uint64_t schedPtr = getMember<uint64_t>(that, 0xe00);
+		SYSLOG("ngreen", "V43: scheduler ptr (0xe00) = 0x%llx %s",
+			   (unsigned long long)schedPtr, schedPtr ? "EXISTS" : "NULL");
+		
+		// V44: Check if accelerator registered with framebuffer controller
+		// Field 0x128c: set to 1 by registerWithFramebufferController() on success
+		// Field 0xde8: callback handler pointer set during FB registration
+		uint8_t fbRegistered = getMember<uint8_t>(that, 0x128c);
+		uint64_t fbCallbackPtr = getMember<uint64_t>(that, 0xde8);
+		SYSLOG("ngreen", "V44: fbRegistered(0x128c)=%u fbCallbackPtr(0xde8)=0x%llx",
+			   fbRegistered, (unsigned long long)fbCallbackPtr);
+		
+		// V44: Dump key IORegistry properties of the accelerator service
+		auto *accelSvc = static_cast<IOService *>(that);
+		auto *metalProp = OSDynamicCast(OSString, accelSvc->getProperty("MetalPluginName"));
+		auto *glProp    = OSDynamicCast(OSString, accelSvc->getProperty("IOGLBundleName"));
+		auto *vaRIDProp = OSDynamicCast(OSNumber, accelSvc->getProperty("IOVARendererID"));
+		SYSLOG("ngreen", "V44: MetalPlugin=%s GL=%s VARendID=0x%x",
+			   metalProp ? metalProp->getCStringNoCopy() : "MISSING",
+			   glProp ? glProp->getCStringNoCopy() : "MISSING",
+			   vaRIDProp ? (uint32_t)vaRIDProp->unsigned32BitValue() : 0);
+	}
 	
 	// Ring buffer state
 	uint32_t rcsHead = NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE));
@@ -2354,8 +2434,9 @@ bool Gen11::AppleIntelBaseControllerstart(void *that,void *param_1)
 		if (service) {
 			SYSLOG("ngreen", "FBController: injecting IntelAccelerator personality into IOCatalogue");
 			
-			auto *dict = OSDictionary::withCapacity(8);
+			auto *dict = OSDictionary::withCapacity(24);
 			if (dict) {
+				// Basic matching properties
 				auto *bi  = OSString::withCString("com.xxxxx.driver.AppleIntelTGLGraphics");
 				auto *cls = OSString::withCString("IntelAccelerator");
 				auto *mc  = OSString::withCString("IOAccelerator");
@@ -2376,6 +2457,59 @@ bool Gen11::AppleIntelBaseControllerstart(void *that,void *param_1)
 				OSSafeReleaseNULL(pv);
 				OSSafeReleaseNULL(pcm);
 				OSSafeReleaseNULL(ps);
+				
+				// V44: GPU driver bundle names — required by IOAcceleratorFamily2 and WindowServer
+				auto *mtl = OSString::withCString("AppleIntelTGLGraphicsMTLDriver");
+				auto *gl  = OSString::withCString("AppleIntelTGLGraphicsGLDriver");
+				auto *dvd = OSString::withCString("AppleIntelTGLGraphicsVADriver");
+				auto *src = OSString::withCString("0.0.0.0.0");
+				auto *vaCodec   = OSString::withCString("Gen10");
+				auto *vaScaler  = OSString::withCString("Gen10");
+				auto *vaBGRA    = OSString::withCString("Gen10");
+				auto *vaRendID  = OSNumber::withNumber(static_cast<unsigned long long>(17301568), 32); // 0x1084000
+				
+				dict->setObject("MetalPluginName", mtl);
+				dict->setObject("IOGLBundleName", gl);
+				dict->setObject("IODVDBundleName", dvd);
+				dict->setObject("IOSourceVersion", src);
+				dict->setObject("IOGVACodec", vaCodec);
+				dict->setObject("IOGVAScaler", vaScaler);
+				dict->setObject("IOGVABGRAEnc", vaBGRA);
+				dict->setObject("IOVARendererID", vaRendID);
+				
+				OSSafeReleaseNULL(mtl);
+				OSSafeReleaseNULL(gl);
+				OSSafeReleaseNULL(dvd);
+				OSSafeReleaseNULL(src);
+				OSSafeReleaseNULL(vaCodec);
+				OSSafeReleaseNULL(vaScaler);
+				OSSafeReleaseNULL(vaBGRA);
+				OSSafeReleaseNULL(vaRendID);
+				
+				// IOAccelerator2D plugin type (required for 2D acceleration matching)
+				auto *pluginDict = OSDictionary::withCapacity(1);
+				if (pluginDict) {
+					auto *pluginName = OSString::withCString("IOAccelerator2D.plugin");
+					pluginDict->setObject("ACCF0000-0000-0000-0000-000a2789904e", pluginName);
+					OSSafeReleaseNULL(pluginName);
+					dict->setObject("IOCFPlugInTypes", pluginDict);
+					pluginDict->release();
+				}
+				
+				// Display pipe capabilities
+				auto *dpCaps = OSDictionary::withCapacity(2);
+				if (dpCaps) {
+					auto *dpSupp = OSNumber::withNumber(static_cast<unsigned long long>(1), 32);
+					auto *trSupp = OSNumber::withNumber(static_cast<unsigned long long>(1), 32);
+					dpCaps->setObject("DisplayPipeSupported", dpSupp);
+					dpCaps->setObject("TransactionsSupported", trSupp);
+					OSSafeReleaseNULL(dpSupp);
+					OSSafeReleaseNULL(trSupp);
+					dict->setObject("IOAccelDisplayPipeCapabilities", dpCaps);
+					dpCaps->release();
+				}
+				
+				SYSLOG("ngreen", "V44: personality has %u properties", dict->getCount());
 				
 				auto *array = OSArray::withCapacity(1);
 				if (array) {
@@ -2543,7 +2677,7 @@ void Gen11::hwSetPowerWellStateAux(void *that,bool param_1,uint param_2)
 
 void Gen11::hwInitializeCState(void *that)
 {
-	SYSLOG("ngreen", "NB-BUILD-V42-CHILDREN-IRQ");
+	SYSLOG("ngreen", "NB-BUILD-V44-FULL-PERSONALITY");
 	int origB48 = getMember<int>(that, 0xB48);
 	int origCE4 = getMember<int>(that, 0xCE4);
 	SYSLOG("ngreen", "hwInitCState B48=%d CE4=%d", origB48, origCE4);
