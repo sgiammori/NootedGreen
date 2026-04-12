@@ -5,6 +5,7 @@
 #include "kern_genx.hpp"
 #include "kern_green.hpp"
 #include <IOKit/IOCatalogue.h>
+#include <kern/thread_call.h>
 
 // ==== 4 kextInfos: LE priority (path[0]), SLE fallback (path[1]) ====
 
@@ -1298,6 +1299,72 @@ uint32_t Gen11::wrapProbeCDClockFrequency(void *that) {
 	return retVal;
 }*/
 
+// V45: Delayed child check callback — runs on a kernel thread after a configurable delay.
+// Logs the IOService state and child count at the specified time after start().
+static void v45DelayedChildCheck(thread_call_param_t p0, thread_call_param_t p1) {
+	auto *svc = static_cast<IOService *>(p0);
+	unsigned delayMs = (unsigned)(uintptr_t)p1;
+	
+	uint64_t state = svc->getState();
+	OSIterator *iter = svc->getClientIterator();
+	int count = 0;
+	if (iter) {
+		OSObject *obj;
+		while ((obj = iter->getNextObject())) {
+			auto *child = OSDynamicCast(IOService, obj);
+			if (child) {
+				SYSLOG("ngreen", "V45: T+%ums child[%d]: %s class=%s state=0x%llx",
+					   delayMs, count, child->getName(),
+					   child->getMetaClass()->getClassName(),
+					   (unsigned long long)child->getState());
+				count++;
+			}
+		}
+		iter->release();
+	}
+	
+	// Also check if the service is open (someone called IOServiceOpen on it)
+	bool isOpen = svc->isOpen();
+	
+	SYSLOG("ngreen", "V45: T+%ums: %d children, state=0x%llx (reg=%d match=%d pub=%d fmatch=%d inact=%d), isOpen=%d",
+		   delayMs, count,
+		   (unsigned long long)state,
+		   !!(state & 0x02), !!(state & 0x04), !!(state & 0x08), !!(state & 0x10), !!(state & 0x01),
+		   isOpen);
+	
+	// Check provider's children too (siblings in IOAccelerator match category)
+	auto *provider = svc->getProvider();
+	if (provider) {
+		OSIterator *sibs = provider->getClientIterator();
+		if (sibs) {
+			int sibIdx = 0;
+			OSObject *s;
+			while ((s = sibs->getNextObject())) {
+				auto *sibSvc = OSDynamicCast(IOService, s);
+				if (sibSvc) {
+					SYSLOG("ngreen", "V45: T+%ums provider child[%d]: %s class=%s",
+						   delayMs, sibIdx, sibSvc->getName(),
+						   sibSvc->getMetaClass()->getClassName());
+					sibIdx++;
+				}
+			}
+			sibs->release();
+		}
+	}
+}
+
+// V45: Helper to schedule a delayed child check
+static void v45ScheduleDelayedCheck(void *accelInstance, unsigned delayMs) {
+	thread_call_t tc = thread_call_allocate(v45DelayedChildCheck,
+											static_cast<thread_call_param_t>(accelInstance));
+	if (tc) {
+		uint64_t deadline;
+		clock_interval_to_deadline(delayMs, kMillisecondScale, &deadline);
+		thread_call_enter1_delayed(tc,
+								   (thread_call_param_t)(uintptr_t)delayMs,
+								   deadline);
+	}
+}
 
 bool Gen11::start(void *that,void  *param_1)
 {
@@ -1674,6 +1741,105 @@ bool Gen11::start(void *that,void  *param_1)
 		SYSLOG("ngreen", "V42: accelerator has %d children after start()", childCount);
 	}
 	
+	// ── V45: IORegistry state & service visibility diagnostics ──
+	{
+		auto *accelSvc = static_cast<IOService *>(that);
+		
+		// 1. IOService state bitmask — verify the service is registered, matched, published
+		uint64_t svcState = accelSvc->getState();
+		SYSLOG("ngreen", "V45: getState()=0x%llx (reg=%d match=%d pub=%d fmatch=%d inact=%d)",
+			   (unsigned long long)svcState,
+			   !!(svcState & 0x02),  // kIOServiceRegisteredState
+			   !!(svcState & 0x04),  // kIOServiceMatchedState
+			   !!(svcState & 0x08),  // kIOServiceFirstPublishState
+			   !!(svcState & 0x10),  // kIOServiceFirstMatchState
+			   !!(svcState & 0x01)); // kIOServiceInactiveState
+		
+		// 2. Provider chain — verify accelerator is attached to IGPU PCI device
+		auto *provider = accelSvc->getProvider();
+		if (provider) {
+			SYSLOG("ngreen", "V45: provider name=%s class=%s state=0x%llx",
+				   provider->getName(),
+				   provider->getMetaClass()->getClassName(),
+				   (unsigned long long)provider->getState());
+			
+			// 3. Enumerate ALL siblings on the same provider to find IOServiceCompatibility
+			OSIterator *siblings = provider->getClientIterator();
+			if (siblings) {
+				OSObject *sib;
+				int sibIdx = 0;
+				while ((sib = siblings->getNextObject())) {
+					auto *sibSvc = OSDynamicCast(IOService, sib);
+					if (sibSvc) {
+						SYSLOG("ngreen", "V45: provider child[%d]: name=%s class=%s state=0x%llx",
+							   sibIdx, sibSvc->getName(),
+							   sibSvc->getMetaClass()->getClassName(),
+							   (unsigned long long)sibSvc->getState());
+						sibIdx++;
+					}
+				}
+				siblings->release();
+			}
+		} else {
+			SYSLOG("ngreen", "V45: WARNING: accelerator has no provider!");
+		}
+		
+		// 4. Check if key properties are present on the service itself
+		bool hasMetal = (accelSvc->getProperty("MetalPluginName") != nullptr);
+		bool hasGL    = (accelSvc->getProperty("IOGLBundleName") != nullptr);
+		bool hasCFPI  = (accelSvc->getProperty("IOCFPlugInTypes") != nullptr);
+		bool hasVARID = (accelSvc->getProperty("IOVARendererID") != nullptr);
+		SYSLOG("ngreen", "V45: properties present: MetalPlugin=%d GL=%d CFPlugIn=%d VARend=%d",
+			   hasMetal, hasGL, hasCFPI, hasVARID);
+		
+		// 5. If MetalPluginName is missing, set GPU properties directly on the service
+		//    (normally they come from the matched personality, but if IOKit didn't merge them...)
+		if (!hasMetal) {
+			SYSLOG("ngreen", "V45: MetalPluginName MISSING — injecting GPU props directly on service");
+			accelSvc->setProperty("MetalPluginName", "AppleIntelTGLGraphicsMTLDriver");
+			accelSvc->setProperty("IOGLBundleName", "AppleIntelTGLGraphicsGLDriver");
+			accelSvc->setProperty("IODVDBundleName", "AppleIntelTGLGraphicsVADriver");
+			accelSvc->setProperty("IOGVACodec", "Gen10");
+			accelSvc->setProperty("IOGVAScaler", "Gen10");
+			accelSvc->setProperty("IOGVABGRAEnc", "Gen10");
+			accelSvc->setProperty("IOSourceVersion", "0.0.0.0.0");
+			auto *vaRendID = OSNumber::withNumber(static_cast<unsigned long long>(17301568), 32);
+			if (vaRendID) { accelSvc->setProperty("IOVARendererID", vaRendID); vaRendID->release(); }
+			auto *dpCaps = OSDictionary::withCapacity(2);
+			if (dpCaps) {
+				auto *v1 = OSNumber::withNumber(1ULL, 32);
+				auto *v2 = OSNumber::withNumber(1ULL, 32);
+				if (v1) { dpCaps->setObject("DisplayPipeSupported", v1); v1->release(); }
+				if (v2) { dpCaps->setObject("TransactionsSupported", v2); v2->release(); }
+				accelSvc->setProperty("IOAccelDisplayPipeCapabilities", dpCaps);
+				dpCaps->release();
+			}
+			auto *cfpi = OSDictionary::withCapacity(1);
+			if (cfpi) {
+				auto *pn = OSString::withCString("IOAccelerator2D.plugin");
+				if (pn) { cfpi->setObject("ACCF0000-0000-0000-0000-000a2789904e", pn); pn->release(); }
+				accelSvc->setProperty("IOCFPlugInTypes", cfpi);
+				cfpi->release();
+			}
+		}
+		
+		// 6. Explicit registerService() — ensures the service is visible to IOKit matching
+		//    even if IntelAccelerator::start() didn't call it or the internal call failed.
+		SYSLOG("ngreen", "V45: calling explicit registerService(kIOServiceAsynchronous) on accelerator");
+		accelSvc->registerService(kIOServiceAsynchronous);
+		
+		// 7. Post-registerService state
+		svcState = accelSvc->getState();
+		SYSLOG("ngreen", "V45: post-registerService state=0x%llx (reg=%d match=%d)",
+			   (unsigned long long)svcState, !!(svcState & 0x02), !!(svcState & 0x04));
+		
+		// 8. Schedule delayed child checks at 3s, 10s, 30s
+		v45ScheduleDelayedCheck(that, 3000);
+		v45ScheduleDelayedCheck(that, 10000);
+		v45ScheduleDelayedCheck(that, 30000);
+		SYSLOG("ngreen", "V45: scheduled delayed child checks at T+3s, T+10s, T+30s");
+	}
+	
 	// Release both ForceWake domains
 	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 0);
 	NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 0);
@@ -1905,6 +2071,14 @@ void Gen11::forceWake(void *that, bool set, uint32_t dom, uint8_t ctx) {
 				iter->release();
 			}
 			SYSLOG("ngreen", "HANGCHECK accelerator has %d children total", childCount);
+			
+			// V45: Log IOService state at hangcheck time
+			uint64_t hcState = service->getState();
+			bool hcOpen = service->isOpen();
+			SYSLOG("ngreen", "HANGCHECK V45: state=0x%llx (reg=%d match=%d pub=%d fmatch=%d inact=%d) isOpen=%d",
+				   (unsigned long long)hcState,
+				   !!(hcState & 0x02), !!(hcState & 0x04), !!(hcState & 0x08),
+				   !!(hcState & 0x10), !!(hcState & 0x01), hcOpen);
 		}
 		
 		// V42: Check interrupt state — did GT_INTR_DW0 re-assert since we cleared it?
@@ -1934,6 +2108,8 @@ void Gen11::forceWake(void *that, bool set, uint32_t dom, uint8_t ctx) {
 					!forceWakeWaitAckFallback(eng.req, eng.ack, ack_exp, mask) &&
 					!pollRegister(eng.ack, ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS))
 					SYSLOG("ngreen", "ForceWake timeout for %s (dom=0x%x), expected 0x%x", eng.name, dom, ack_exp);
+				else
+					DBGLOG("ngreen", "ForceWake OK %s set=%d", eng.name, set);
 			}
 		} else {
 			wrapWriteRegister32(callback->framecont, fwReqReg(d), wr);
@@ -1942,8 +2118,11 @@ void Gen11::forceWake(void *that, bool set, uint32_t dom, uint8_t ctx) {
 				!forceWakeWaitAckFallback(fwReqReg(d), fwAckReg(d), ack_exp, mask) &&
 				!pollRegister(fwAckReg(d), ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS))
 				SYSLOG("ngreen", "ForceWake timeout for domain %s (dom=0x%x), expected 0x%x", strForDom(d), dom, ack_exp);
+			else
+				DBGLOG("ngreen", "ForceWake OK domain=%s set=%d ack=0x%x", strForDom(d), set, wrapReadRegister32(callback->framecont, fwAckReg(d)));
 		}
 	}
+	SYSLOG("ngreen", "forceWake done: set=%d dom=0x%x", set, dom);
 }
 
 bool Gen11::pollRegister(uint32_t reg, uint32_t val, uint32_t mask, uint32_t timeout) {
@@ -2677,7 +2856,7 @@ void Gen11::hwSetPowerWellStateAux(void *that,bool param_1,uint param_2)
 
 void Gen11::hwInitializeCState(void *that)
 {
-	SYSLOG("ngreen", "NB-BUILD-V44-FULL-PERSONALITY");
+	SYSLOG("ngreen", "NB-BUILD-V45B-FW-DONE-LOG");
 	int origB48 = getMember<int>(that, 0xB48);
 	int origCE4 = getMember<int>(that, 0xCE4);
 	SYSLOG("ngreen", "hwInitCState B48=%d CE4=%d", origB48, origCE4);
