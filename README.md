@@ -55,6 +55,30 @@ The Intel TGL graphics driver supports three scheduler types, selectable at boot
 
 Type 5 bypasses `IGScheduler::initFirmware()` entirely, avoiding GuC/HuC binary loading which fails on spoofed devices. The RCS ring is initialized directly by the host driver.
 
+## Cross-Platform Detection (V52)
+
+NootedGreen uses inline CPUID (`EAX=1`) at load time to read the real CPU model — no config.plist or device-ID spoofing can fake this. The result sets `isRealTGL`:
+
+| CPU | Model | `isRealTGL` |
+|-----|-------|-------------|
+| Tiger Lake-U (i7-1165G7, etc.) | `0x8C` | `true` |
+| Tiger Lake-H (i7-11800H, etc.) | `0x8D` | `true` |
+| Raptor Lake-P (i7-13700H, etc.) | `0xBA` | `false` |
+| Raptor Lake-S | `0xBF` | `false` |
+| Raptor Lake-HX | `0xB7` | `false` |
+| Alder Lake-P | `0x9A` | `false` |
+| Alder Lake-S | `0x97` | `false` |
+
+When `isRealTGL = false` (RPL/ADL), the following RPL-specific patches are applied:
+
+- **Topology overrides** — L3 bank count, max EU count, subslice count hardcoded for 96EU RPL config
+- **BCS engine bypass** — skip blitter engine init in `hwDevStart` (RPL BCS is dead under TGL driver)
+- **GuC binary stub** — `loadGuCBinary` returns 1 instead of loading firmware (wrong microarch)
+- **MultiForceWakeSelect=1** — redirect ForceWake to hooked `SafeForceWakeMultithreaded` (RPL ACK=0 on native path)
+- **BCS engine reset** — stop+clear dead BCS ring after `start()` (V51)
+
+When `isRealTGL = true`, all of the above are skipped — the driver uses Apple's native topology, GuC firmware, ForceWake, and BCS engine as-is.
+
 ### Required GPU driver bundles
 
 For GPU acceleration, the following userspace driver bundles must be installed in `/Library/Extensions/`:
