@@ -118,24 +118,29 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	
 	
     if (getKernelVersion() >= KernelVersion::Ventura) {
-        const DYLDPatch patches[] = {
-			
-			//{f1, r1, "f1"},
-			//{f2, r2, "f2"},
-			
-			//{f3, r3, "f3"},
-			//{f3b, r3b, "f3b"},
-			
-			//{f4, r4, "f4"},
-			
-			{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-			{f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma)"},
-			{f_skippresent_sonoma, r_skippresent_sonoma, "Display::Present skip (Sonoma)"},
-			{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
-			{f_skipac_sonoma, r_skipac_sonoma, "AccessComplete skip (Sonoma)"},
-
-        };
-        DYLDPatch::applyAll(patches, const_cast<void *>(data), PAGE_SIZE);
+        // V47: Check boot-arg to control CoreDisplay Metal patches.
+        // With -ngreenAllowMetal, skip the 5 CoreDisplay patches that block Metal rendering.
+        // Without it, apply them as before (safe fallback — Metal blocked, no GPU commands submitted).
+        bool allowMetal = checkKernelArgument("-ngreenAllowMetal");
+        
+        if (allowMetal) {
+            SYSLOG("DYLD", "V47: -ngreenAllowMetal set — skipping CoreDisplay Metal-blocking patches");
+            // Only apply the assertion bypass — still needed to prevent assert crash
+            const DYLDPatch patches[] = {
+                {f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
+            };
+            DYLDPatch::applyAll(patches, const_cast<void *>(data), PAGE_SIZE);
+        } else {
+            DBGLOG("DYLD", "V47: Metal blocked (no -ngreenAllowMetal) — applying all CoreDisplay patches");
+            const DYLDPatch patches[] = {
+                {f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
+                {f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma)"},
+                {f_skippresent_sonoma, r_skippresent_sonoma, "Display::Present skip (Sonoma)"},
+                {f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
+                {f_skipac_sonoma, r_skipac_sonoma, "AccessComplete skip (Sonoma)"},
+            };
+            DYLDPatch::applyAll(patches, const_cast<void *>(data), PAGE_SIZE);
+        }
     }
 
 	

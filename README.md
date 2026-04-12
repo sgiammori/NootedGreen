@@ -8,7 +8,7 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 
 ## Status
 
-**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises, host-based scheduler (type 5) active with RCS ring running. Display pipeline working (eDP trained, cursor visible). GPU acceleration under active development — IOAccelF2 patches applied, full personality injected, userspace driver bundles staged.
+**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises, host-based scheduler (type 5) active with RCS ring running. Display pipeline working (eDP trained, cursor visible). WindowServer connects successfully — 12 user clients created (2x IGAccel2DContext, 2x IOAccelDisplayPipeUserClient2, 8x IGAccelSurface). Metal rendering path conditionally enabled via boot-arg. GPU command submission under active development.
 
 ## Requirements
 
@@ -20,7 +20,7 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 ## Boot args
 
 ```
--v keepsyms=1 debug=0x100 IGLogLevel=8 -wegdbg -NGreenDebug -liludbg liludump=60 -nbdyldoff ngreen-dmc=skip -allow3d -disablegfxfirmware
+-v keepsyms=1 debug=0x100 IGLogLevel=8 -wegdbg -NGreenDebug -liludbg liludump=60 -nbdyldoff ngreen-dmc=skip -allow3d -disablegfxfirmware -ngreenAllowMetal
 ```
 
 | Arg | Purpose |
@@ -31,6 +31,7 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 | `-nbdyldoff` | Disable DYLD patches |
 | `ngreen-dmc=skip` | Skip DMC firmware |
 | `-allow3d` | Force 3D acceleration |
+| `-ngreenAllowMetal` | Allow Metal rendering — skip CoreDisplay patches that block Metal GPU commands (V47+) |
 | `-nbwegcoex` | Enable WEG coexistence mode (run alongside WhateverGreen, skips overlapping routes) |
 | `IGLogLevel=8` | Maximum Intel GPU driver logging |
 | `-wegdbg` | Enable WhateverGreen debug logging |

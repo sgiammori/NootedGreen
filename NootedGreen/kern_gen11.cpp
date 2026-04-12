@@ -1866,6 +1866,28 @@ bool Gen11::start(void *that,void  *param_1)
 		SYSLOG("ngreen", "V45: scheduled delayed child checks at T+3s, T+10s, T+30s");
 	}
 	
+	// ── V47: Enable Master Interrupt (GFX_MSTR_IRQ bit 31) ──
+	// Without this, the GPU can't deliver interrupts to the CPU, and the
+	// scheduler never gets completion notifications. i915 does this in
+	// gen11_master_intr_enable() — just write (1 << 31) to 0x190010.
+	{
+		uint32_t mstrIrq = NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ);
+		SYSLOG("ngreen", "V47: GFX_MSTR_IRQ before enable = 0x%x (bit31=%d)", mstrIrq, !!(mstrIrq & GEN11_MASTER_IRQ));
+		if (!(mstrIrq & GEN11_MASTER_IRQ)) {
+			NGreen::callback->writeReg32(GEN11_GFX_MSTR_IRQ, GEN11_MASTER_IRQ);
+			IODelay(100);
+			uint32_t after = NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ);
+			SYSLOG("ngreen", "V47: GFX_MSTR_IRQ after enable  = 0x%x (bit31=%d)", after, !!(after & GEN11_MASTER_IRQ));
+		} else {
+			SYSLOG("ngreen", "V47: Master IRQ already enabled");
+		}
+	}
+	
+	// ── V47: Log initial RING_TIMESTAMP for RCS and BCS ──
+	SYSLOG("ngreen", "V47: RCS RING_TIMESTAMP=0x%x BCS RING_TIMESTAMP=0x%x",
+		NGreen::callback->readReg32(RENDER_RING_BASE + 0x358),
+		NGreen::callback->readReg32(BLT_RING_BASE + 0x358));
+	
 	// Release both ForceWake domains
 	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 0);
 	NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 0);
@@ -2060,6 +2082,21 @@ void Gen11::forceWake(void *that, bool set, uint32_t dom, uint8_t ctx) {
 		SYSLOG("ngreen", "HANGCHECK GT_INTR_DW0=0x%x DW1=0x%x",
 			NGreen::callback->readReg32(0x190018),
 			NGreen::callback->readReg32(0x19001C));
+		
+		// V47: RING_TIMESTAMP — check if GPU engines have processed any commands
+		// Timestamp increments with GPU clock whenever the engine is active.
+		// If it's 0 or unchanged from start, the engine never executed anything.
+		SYSLOG("ngreen", "HANGCHECK V47: RCS RING_TIMESTAMP=0x%x BCS RING_TIMESTAMP=0x%x",
+			NGreen::callback->readReg32(RENDER_RING_BASE + 0x358),
+			NGreen::callback->readReg32(BLT_RING_BASE + 0x358));
+		
+		// V47: Re-check GFX_MSTR_IRQ — did someone disable master interrupt since start?
+		uint32_t hcMstr = NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ);
+		SYSLOG("ngreen", "HANGCHECK V47: GFX_MSTR_IRQ=0x%x (bit31=%d)", hcMstr, !!(hcMstr & GEN11_MASTER_IRQ));
+		if (!(hcMstr & GEN11_MASTER_IRQ)) {
+			SYSLOG("ngreen", "HANGCHECK V47: Master IRQ disabled! Re-enabling...");
+			NGreen::callback->writeReg32(GEN11_GFX_MSTR_IRQ, GEN11_MASTER_IRQ);
+		}
 		
 		// Release ForceWake
 		NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 0);
@@ -2882,7 +2919,7 @@ void Gen11::hwSetPowerWellStateAux(void *that,bool param_1,uint param_2)
 
 void Gen11::hwInitializeCState(void *that)
 {
-	SYSLOG("ngreen", "NB-BUILD-V46-DEVSTART-BYPASS");
+	SYSLOG("ngreen", "NB-BUILD-V47-ALLOW-METAL");
 	int origB48 = getMember<int>(that, 0xB48);
 	int origCE4 = getMember<int>(that, 0xCE4);
 	SYSLOG("ngreen", "hwInitCState B48=%d CE4=%d", origB48, origCE4);
