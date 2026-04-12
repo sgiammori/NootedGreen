@@ -1356,18 +1356,29 @@ static void v45DelayedChildCheck(thread_call_param_t p0, thread_call_param_t p1)
 					   child->getMetaClass()->getClassName(),
 					   (unsigned long long)childState);
 				
-				// V54: If IGAccelDevice exists but is not registered (state=0x0),
-				// force registerService() on it. Without this, Metal/GL can't open the device.
-				if (childState == 0 && delayMs >= 3000) {
+				// V55: Enhanced IGAccelDevice diagnostics + force-start
+				if (delayMs >= 3000) {
 					const char *childName = child->getName();
 					if (childName && (strcmp(childName, "IGAccelDevice") == 0 ||
 									  strcmp(childName, "IGAccelSharedUserClient") == 0)) {
-						SYSLOG("ngreen", "V54: %s at state=0x0 — calling registerService()", childName);
-						child->registerService(kIOServiceAsynchronous);
-						IODelay(100);
-						uint64_t newState = child->getState();
-						SYSLOG("ngreen", "V54: %s after registerService → state=0x%llx",
-							   childName, (unsigned long long)newState);
+						// Dump child's provider and property state
+						auto *childProvider = child->getProvider();
+						SYSLOG("ngreen", "V55: %s state=0x%llx provider=%s isOpen=%d",
+							   childName, (unsigned long long)childState,
+							   childProvider ? childProvider->getName() : "NULL",
+							   child->isOpen());
+						
+						// Check if the accelerator (our parent) is open
+						SYSLOG("ngreen", "V55: accelerator isOpen=%d", svc->isOpen());
+						
+						if (childState == 0) {
+							SYSLOG("ngreen", "V55: %s at state=0x0 — calling registerService()", childName);
+							child->registerService(kIOServiceAsynchronous);
+							IODelay(500);
+							uint64_t newState = child->getState();
+							SYSLOG("ngreen", "V55: %s after registerService → state=0x%llx",
+								   childName, (unsigned long long)newState);
+						}
 					}
 				}
 				count++;
@@ -1579,7 +1590,24 @@ bool Gen11::start(void *that,void  *param_1)
 		NGreen::callback->readReg32(RING_MI_MODE(RENDER_RING_BASE)),
 		NGreen::callback->readReg32(RING_MODE(RENDER_RING_BASE)));
 	
-	SYSLOG("ngreen", "Pre-start ERROR_GEN6=0x%x", NGreen::callback->readReg32(ERROR_GEN6));
+	{
+		uint32_t errPreStart = NGreen::callback->readReg32(ERROR_GEN6);
+		SYSLOG("ngreen", "Pre-start ERROR_GEN6=0x%x", errPreStart);
+		
+		// V55: Clear stale errors BEFORE start() so the driver's internal
+		// initialization doesn't see HARDWARE_ERROR/PAGE_TABLE_ERROR and abort.
+		if (errPreStart) {
+			NGreen::callback->writeReg32(ERROR_GEN6, errPreStart);  // W1C
+			IODelay(100);
+			// Also clear per-engine error registers
+			uint32_t rcsEir = NGreen::callback->readReg32(RING_EIR(RENDER_RING_BASE));
+			uint32_t bcsEir = NGreen::callback->readReg32(RING_EIR(BLT_RING_BASE));
+			if (rcsEir) NGreen::callback->writeReg32(RING_EIR(RENDER_RING_BASE), rcsEir);
+			if (bcsEir) NGreen::callback->writeReg32(RING_EIR(BLT_RING_BASE), bcsEir);
+			uint32_t errAfter = NGreen::callback->readReg32(ERROR_GEN6);
+			SYSLOG("ngreen", "V55: Pre-start error clear: 0x%x -> 0x%x", errPreStart, errAfter);
+		}
+	}
 	
 	// GT workarounds
 	uint32_t misccpctl = NGreen::callback->readReg32(GEN7_MISCCPCTL);
@@ -1925,7 +1953,9 @@ bool Gen11::start(void *that,void  *param_1)
 		v45ScheduleDelayedCheck(that, 3000);
 		v45ScheduleDelayedCheck(that, 10000);
 		v45ScheduleDelayedCheck(that, 30000);
-		SYSLOG("ngreen", "V45: scheduled delayed child checks at T+3s, T+10s, T+30s");
+		v45ScheduleDelayedCheck(that, 60000);
+		v45ScheduleDelayedCheck(that, 120000);
+		SYSLOG("ngreen", "V55: scheduled delayed child checks at T+3s, T+10s, T+30s, T+60s, T+120s");
 	}
 	
 	// ── V47: Enable Master Interrupt (GFX_MSTR_IRQ bit 31) ──
@@ -1960,13 +1990,17 @@ bool Gen11::start(void *that,void  *param_1)
 	// the Metal plugin to reject the device during MTLDevice creation.
 	// Per-engine EIR/ESR registers are also W1C.
 	{
-		// 1. Clear global error register
+		// 1. Clear global error register — try multiple times with W1C
 		uint32_t errPre = NGreen::callback->readReg32(ERROR_GEN6);
 		if (errPre) {
-			NGreen::callback->writeReg32(ERROR_GEN6, errPre);
-			IODelay(100);
-			uint32_t errPost = NGreen::callback->readReg32(ERROR_GEN6);
-			SYSLOG("ngreen", "V51: cleared ERROR_GEN6: 0x%x -> 0x%x", errPre, errPost);
+			// V55: Loop clear — stale errors may re-generate from in-flight ops
+			for (int i = 0; i < 3; i++) {
+				NGreen::callback->writeReg32(ERROR_GEN6, errPre);
+				IODelay(200);
+				errPre = NGreen::callback->readReg32(ERROR_GEN6);
+				if (!errPre) break;
+			}
+			SYSLOG("ngreen", "V51: cleared ERROR_GEN6 → 0x%x (after loop)", errPre);
 		} else {
 			SYSLOG("ngreen", "V51: ERROR_GEN6 already clean");
 		}
@@ -2041,6 +2075,34 @@ bool Gen11::start(void *that,void  *param_1)
 	}
 	} else {
 		SYSLOG("ngreen", "V52: Real TGL — skipping BCS engine reset");
+	}
+	
+	// ── V55: TLB invalidation + aggressive error clearing ──
+	// V54 showed ERROR_GEN6=0x7b cannot be cleared via simple W1C because the GPU
+	// continuously re-generates errors (TLB_MISS + PAGE_TABLE_ERROR). The root cause
+	// is stale TLB entries from the context init path. Flush TLBs first, then re-clear.
+	if (!NGreen::callback->isRealTGL) {
+		// 1. Invalidate GPU TLBs via GEN12 MMIO (no GuC needed)
+		//    GEN12_GUC_TLB_INV_CR (0xcee8): write to trigger TLB invalidation
+		//    Each bit corresponds to an engine: bit0=RCS, bit1=BCS, etc.
+		NGreen::callback->writeReg32(0xcee8, 0x1);   // Invalidate RCS TLBs
+		IODelay(500);
+		NGreen::callback->writeReg32(0xcee8, 0x4);   // Invalidate BCS TLBs
+		IODelay(500);
+		SYSLOG("ngreen", "V55: TLB invalidation requested (RCS+BCS)");
+		
+		// 2. Try clearing ERROR_GEN6 multiple times after TLB flush
+		uint32_t errLoop = NGreen::callback->readReg32(ERROR_GEN6);
+		for (int attempt = 0; attempt < 5 && errLoop; attempt++) {
+			NGreen::callback->writeReg32(ERROR_GEN6, errLoop);  // W1C
+			IODelay(200);
+			errLoop = NGreen::callback->readReg32(ERROR_GEN6);
+		}
+		SYSLOG("ngreen", "V55: ERROR_GEN6 after TLB flush + 5x clear = 0x%x", errLoop);
+		
+		// 3. Read back TLB invalidation status
+		uint32_t tlbInvDone = NGreen::callback->readReg32(0xceec);
+		SYSLOG("ngreen", "V55: TLB_INV done status = 0x%x", tlbInvDone);
 	}
 	
 	SYSLOG("ngreen", "V51: GPU error clearing complete — Metal should see a clean GPU");
