@@ -277,6 +277,19 @@ struct PACKED intel_dmc_header_v3 {
 #define GEN8_FAULT_TLB_DATA0	0x4B10
 #define GEN8_FAULT_TLB_DATA1	0x4B14
 
+// Engine reset registers (Gen6+)
+#define GEN6_GDRST				0x941c
+#define   GEN6_GRDOM_FULL		(1 << 0)
+#define   GEN6_GRDOM_RENDER		(1 << 1)
+#define   GEN6_GRDOM_MEDIA		(1 << 2)
+#define   GEN6_GRDOM_BLT		(1 << 3)
+
+// Per-engine reset control (Gen12+)
+#define RING_RESET_CTL(base)		((base) + 0xd0)
+#define   RESET_CTL_REQUEST_RESET	(1 << 0)
+#define   RESET_CTL_READY_TO_RESET	(1 << 1)
+#define   RESET_CTL_CAT_ERROR		(1 << 2)
+
 // GGTT PTE base within BAR0 (Gen8+: 8MB into MMIO BAR, each PTE is 8 bytes)
 #define GEN8_GGTT_PTE_BASE		0x800000
 #define GGTT_PTE_LO(page)		(GEN8_GGTT_PTE_BASE + (page) * 8)
@@ -1276,6 +1289,7 @@ private:
 	// ── Accelerator start & forcewake ──
 	static bool start(void *that,void  *param_1);   // IntelAccelerator::start wrapper
 	static void v54IrqWatchdog(thread_call_param_t, thread_call_param_t);  // V54: IRQ watchdog
+	static void v56GpuHealthMonitor(thread_call_param_t, thread_call_param_t);  // V56: periodic GPU health monitor
 	mach_vm_address_t ostart {};
 	
 	static bool patchRCSCheck(mach_vm_address_t& start);  // bypass RCS engine check

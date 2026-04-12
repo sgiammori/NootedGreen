@@ -1430,6 +1430,70 @@ static void v45ScheduleDelayedCheck(void *accelInstance, unsigned delayMs) {
 	}
 }
 
+// V56: Periodic GPU health monitor — logs ERROR_GEN6 + ring state every 2s for 60s.
+// Gives continuous visibility around the IGAccelDevice teardown event.
+void Gen11::v56GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t param1) {
+	static int v56MonitorCount = 0;
+	v56MonitorCount++;
+	
+	auto *svc = static_cast<IOService *>(param0);
+	
+	// Read GPU error state
+	uint32_t errGen6 = NGreen::callback->readReg32(ERROR_GEN6);
+	uint32_t rcsHead = NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE));
+	uint32_t rcsTail = NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE));
+	uint32_t rcsCtl  = NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE));
+	uint32_t mstrIrq = NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ);
+	
+	// Count children and get IGAccelDevice state
+	int childCount = 0;
+	uint64_t accelDevState = 0xDEAD;
+	bool anyOpen = false;
+	
+	OSIterator *iter = svc->getClientIterator();
+	if (iter) {
+		OSObject *obj;
+		while ((obj = iter->getNextObject())) {
+			auto *child = OSDynamicCast(IOService, obj);
+			if (child) {
+				const char *cn = child->getName();
+				if (cn && strcmp(cn, "IGAccelDevice") == 0) {
+					accelDevState = child->getState();
+					anyOpen = child->isOpen();
+				}
+				childCount++;
+			}
+		}
+		iter->release();
+	}
+	
+	SYSLOG("ngreen", "V56M[%d]: ERR=0x%x HEAD=0x%x TAIL=0x%x CTL=0x%x IRQ=0x%x ch=%d IGDev=0x%llx open=%d",
+		   v56MonitorCount, errGen6, rcsHead, rcsTail, rcsCtl, mstrIrq,
+		   childCount, (unsigned long long)accelDevState, anyOpen);
+	
+	// If ERROR_GEN6 is set, try to clear it
+	if (errGen6) {
+		NGreen::callback->writeReg32(ERROR_GEN6, errGen6);
+		IODelay(100);
+		uint32_t errAfter = NGreen::callback->readReg32(ERROR_GEN6);
+		if (errAfter != errGen6) {
+			SYSLOG("ngreen", "V56M[%d]: ERROR_GEN6 clear 0x%x → 0x%x", v56MonitorCount, errGen6, errAfter);
+		}
+	}
+	
+	// Re-arm for up to 30 iterations (60s at 2s interval)
+	if (v56MonitorCount < 30) {
+		auto nextTimer = thread_call_allocate(v56GpuHealthMonitor, param0);
+		if (nextTimer) {
+			uint64_t deadline;
+			clock_interval_to_deadline(2, kSecondScale, &deadline);
+			thread_call_enter_delayed(nextTimer, deadline);
+		}
+	} else {
+		SYSLOG("ngreen", "V56M: health monitor complete after %d iterations", v56MonitorCount);
+	}
+}
+
 // V54: IRQ watchdog — re-enables Master IRQ if the driver disables it during init.
 // Fires every 2s, up to 5 times (10s total), then stops.
 void Gen11::v54IrqWatchdog(thread_call_param_t param0, thread_call_param_t) {
@@ -1949,13 +2013,27 @@ bool Gen11::start(void *that,void  *param_1)
 		SYSLOG("ngreen", "V45: post-registerService state=0x%llx (reg=%d match=%d)",
 			   (unsigned long long)svcState, !!(svcState & 0x02), !!(svcState & 0x04));
 		
-		// 8. Schedule delayed child checks at 3s, 10s, 30s
+		// 8. Schedule delayed child checks at 3s, 10s, 15s, 20s, 30s, 60s, 120s
 		v45ScheduleDelayedCheck(that, 3000);
 		v45ScheduleDelayedCheck(that, 10000);
+		v45ScheduleDelayedCheck(that, 15000);   // V56: pinpoint teardown timing
+		v45ScheduleDelayedCheck(that, 20000);   // V56: pinpoint teardown timing
 		v45ScheduleDelayedCheck(that, 30000);
 		v45ScheduleDelayedCheck(that, 60000);
 		v45ScheduleDelayedCheck(that, 120000);
-		SYSLOG("ngreen", "V55: scheduled delayed child checks at T+3s, T+10s, T+30s, T+60s, T+120s");
+		SYSLOG("ngreen", "V56: scheduled delayed child checks at T+3,10,15,20,30,60,120s");
+		
+		// V56: Start periodic GPU health monitor (every 2s for 60s)
+		{
+			auto monTimer = thread_call_allocate(v56GpuHealthMonitor,
+												 static_cast<thread_call_param_t>(static_cast<IOService *>(that)));
+			if (monTimer) {
+				uint64_t deadline;
+				clock_interval_to_deadline(2, kSecondScale, &deadline);
+				thread_call_enter_delayed(monTimer, deadline);
+				SYSLOG("ngreen", "V56: GPU health monitor armed — 2s interval, 30 iterations");
+			}
+		}
 	}
 	
 	// ── V47: Enable Master Interrupt (GFX_MSTR_IRQ bit 31) ──
@@ -2103,6 +2181,83 @@ bool Gen11::start(void *that,void  *param_1)
 		// 3. Read back TLB invalidation status
 		uint32_t tlbInvDone = NGreen::callback->readReg32(0xceec);
 		SYSLOG("ngreen", "V55: TLB_INV done status = 0x%x", tlbInvDone);
+		
+		// ── V56: Per-engine reset via RING_RESET_CTL ──
+		// V55 showed ERROR_GEN6=0x7b contains UNRECOVERABLE bit (bit 6).
+		// W1C clearing never works because error condition is continuously reasserted.
+		// A per-engine reset should clear the hardware error state.
+		{
+			// Read pre-reset state 
+			uint32_t preErr = NGreen::callback->readReg32(ERROR_GEN6);
+			uint32_t preResetCtl = NGreen::callback->readReg32(RING_RESET_CTL(RENDER_RING_BASE));
+			SYSLOG("ngreen", "V56: Pre-reset RCS RESET_CTL=0x%x ERROR_GEN6=0x%x", preResetCtl, preErr);
+			
+			// 1. Request RCS engine reset
+			NGreen::callback->writeReg32(RING_RESET_CTL(RENDER_RING_BASE), RESET_CTL_REQUEST_RESET);
+			IODelay(500);
+			
+			// 2. Poll for READY_TO_RESET (bit 1) — up to 50ms
+			bool resetReady = false;
+			for (int i = 0; i < 50; i++) {
+				uint32_t ctl = NGreen::callback->readReg32(RING_RESET_CTL(RENDER_RING_BASE));
+				if (ctl & RESET_CTL_READY_TO_RESET) {
+					resetReady = true;
+					SYSLOG("ngreen", "V56: RCS reset ready after %d polls (RESET_CTL=0x%x)", i, ctl);
+					break;
+				}
+				IODelay(1000);
+			}
+			
+			if (!resetReady) {
+				uint32_t ctl = NGreen::callback->readReg32(RING_RESET_CTL(RENDER_RING_BASE));
+				SYSLOG("ngreen", "V56: RCS reset NOT ready after 50 polls (RESET_CTL=0x%x)", ctl);
+			}
+			
+			// 3. Clear reset request
+			NGreen::callback->writeReg32(RING_RESET_CTL(RENDER_RING_BASE), 0);
+			IODelay(200);
+			
+			// 4. Check ERROR_GEN6 after engine reset
+			uint32_t postErr = NGreen::callback->readReg32(ERROR_GEN6);
+			uint32_t postResetCtl = NGreen::callback->readReg32(RING_RESET_CTL(RENDER_RING_BASE));
+			SYSLOG("ngreen", "V56: Post-reset RCS RESET_CTL=0x%x ERROR_GEN6=0x%x", postResetCtl, postErr);
+			
+			// 5. Try W1C clear after reset
+			if (postErr) {
+				NGreen::callback->writeReg32(ERROR_GEN6, 0xFFFFFFFF);
+				IODelay(200);
+				uint32_t finalErr = NGreen::callback->readReg32(ERROR_GEN6);
+				SYSLOG("ngreen", "V56: ERROR_GEN6 after 0xFFFFFFFF W1C = 0x%x", finalErr);
+			}
+			
+			// 6. Also try GEN6_GDRST (legacy global device reset target)
+			uint32_t preGdrst = NGreen::callback->readReg32(GEN6_GDRST);
+			SYSLOG("ngreen", "V56: GEN6_GDRST pre-write = 0x%x", preGdrst);
+			NGreen::callback->writeReg32(GEN6_GDRST, GEN6_GRDOM_RENDER);
+			IODelay(1000);
+			// Poll for bit to self-clear
+			bool gdrDone = false;
+			for (int i = 0; i < 50; i++) {
+				uint32_t g = NGreen::callback->readReg32(GEN6_GDRST);
+				if (!(g & GEN6_GRDOM_RENDER)) {
+					gdrDone = true;
+					SYSLOG("ngreen", "V56: GDRST render reset done after %d polls (0x%x)", i, g);
+					break;
+				}
+				IODelay(1000);
+			}
+			if (!gdrDone) {
+				SYSLOG("ngreen", "V56: GDRST render reset timeout (0x%x)", NGreen::callback->readReg32(GEN6_GDRST));
+			}
+			
+			// 7. Final ERROR_GEN6 read after both resets
+			uint32_t err56 = NGreen::callback->readReg32(ERROR_GEN6);
+			uint32_t head56 = NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE));
+			uint32_t tail56 = NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE));
+			uint32_t ctl56 = NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE));
+			SYSLOG("ngreen", "V56: Final state — ERROR_GEN6=0x%x RCS HEAD=0x%x TAIL=0x%x CTL=0x%x",
+				   err56, head56, tail56, ctl56);
+		}
 	}
 	
 	SYSLOG("ngreen", "V51: GPU error clearing complete — Metal should see a clean GPU");
