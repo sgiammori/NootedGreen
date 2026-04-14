@@ -1844,6 +1844,99 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 			   v60Count, pwrWell, dcState);
 	}
 
+	// ── V76: Deep display diagnostic + framebuffer physical write test ──
+	// V75 proved: ALL display regs are correctly configured (pipe, plane, DDI, backlight ON).
+	// Black screen must be because SURF=0x412ad000 points to unwritten (zeroed) memory.
+	// Verify GGTT mapping, check WM/PSR, and write a white test pattern directly
+	// to the framebuffer surface physical memory to prove the display pipeline works.
+	if (v60Count == 5) {
+		// 1. Read PLANE_SURF to get current surface GGTT address
+		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
+		uint32_t surfPage = surfAddr >> 12;  // GGTT page number
+
+		// 2. Read GGTT PTE for this page — verify mapping is valid
+		uint32_t pteLo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPage));
+		uint32_t pteHi = NGreen::callback->readReg32(GGTT_PTE_HI(surfPage));
+		uint64_t pte = ((uint64_t)pteHi << 32) | pteLo;
+		uint64_t physAddr = pte & 0x0000FFFFFFFFF000ULL;
+		bool pteValid = (pteLo & 0x1) != 0;
+		SYSLOG("ngreen", "V76[%d]: SURF=0x%x page=0x%x PTE=0x%x:%08x phys=0x%llx valid=%d",
+			   v60Count, surfAddr, surfPage, pteHi, pteLo,
+			   (unsigned long long)physAddr, pteValid);
+
+		// Also check a few neighboring GGTT pages for the surface
+		for (int i = 1; i <= 3; i++) {
+			uint32_t nLo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPage + i));
+			uint32_t nHi = NGreen::callback->readReg32(GGTT_PTE_HI(surfPage + i));
+			uint64_t nPhys = (((uint64_t)nHi << 32) | nLo) & 0x0000FFFFFFFFF000ULL;
+			SYSLOG("ngreen", "V76[%d]: SURF+%d PTE=0x%x:%08x phys=0x%llx v=%d",
+				   v60Count, i, nHi, nLo, (unsigned long long)nPhys, nLo & 1);
+		}
+
+		// 3. Watermark registers — if wrong, the plane gets no FIFO bandwidth → blank
+		uint32_t wm0 = NGreen::callback->readReg32(0x70240); // CUR_WM_A_0 (WM level 0)
+		uint32_t wm1 = NGreen::callback->readReg32(0x70244); // CUR_WM_A_1
+		uint32_t planWm0 = NGreen::callback->readReg32(0x70268); // PLANE_WM_A_0 (plane 1 WM level 0)
+		uint32_t planWm1 = NGreen::callback->readReg32(0x7026C); // PLANE_WM_A_1
+		uint32_t planWmT = NGreen::callback->readReg32(0x70278); // PLANE_WM_TRANS (transition WM)
+		SYSLOG("ngreen", "V76[%d]: WM cur0=0x%x cur1=0x%x plan0=0x%x plan1=0x%x planT=0x%x",
+			   v60Count, wm0, wm1, planWm0, planWm1, planWmT);
+
+		// 4. PSR—Panel Self-Refresh: if active and confused, panel may show stale/black
+		uint32_t psrCtl  = NGreen::callback->readReg32(0x64800); // EDP_PSR_CTL
+		uint32_t psrSts  = NGreen::callback->readReg32(0x64840); // EDP_PSR_STATUS
+		uint32_t psrCtl2 = NGreen::callback->readReg32(0x60900); // EDP_PSR2_CTL
+		SYSLOG("ngreen", "V76[%d]: PSR_CTL=0x%x PSR_STATUS=0x%x PSR2_CTL=0x%x",
+			   v60Count, psrCtl, psrSts, psrCtl2);
+
+		// 5. Gamma LUT sample — if gamma table is zeroed, all output = black
+		// Read PREC_PAL_INDEX_A, set index, read data
+		uint32_t gammaIdx = NGreen::callback->readReg32(0x4A400); // PREC_PAL_INDEX_A
+		NGreen::callback->writeReg32(0x4A400, 0);                 // Set index to 0
+		uint32_t gamma0 = NGreen::callback->readReg32(0x4A404);   // PREC_PAL_DATA_A
+		NGreen::callback->writeReg32(0x4A400, 128);                // Mid-range index
+		uint32_t gamma128 = NGreen::callback->readReg32(0x4A404);
+		NGreen::callback->writeReg32(0x4A400, 255);                // Near max index
+		uint32_t gamma255 = NGreen::callback->readReg32(0x4A404);
+		NGreen::callback->writeReg32(0x4A400, gammaIdx);           // Restore original index
+		SYSLOG("ngreen", "V76[%d]: GAMMA idx_was=0x%x g[0]=0x%x g[128]=0x%x g[255]=0x%x",
+			   v60Count, gammaIdx, gamma0, gamma128, gamma255);
+
+		// 6. Framebuffer physical write test — write white pixels to the first
+		// 64 rows of the display surface to prove the display pipeline works.
+		// This uses IOMemoryDescriptor to map the physical stolen memory page.
+		if (pteValid && physAddr != 0) {
+			// Map 64 rows: stride=10240 bytes (0xa0*64), 64 rows = 655360 bytes
+			// But just map first 4 pages (16KB) for a minimal test = ~1.5 rows
+			auto *desc = IOMemoryDescriptor::withPhysicalAddress(
+				(IOPhysicalAddress)physAddr, 16384, kIODirectionInOut);
+			if (desc) {
+				auto *map = desc->createMappingInTask(kernel_task, 0,
+					kIOMapAnywhere | kIOMapInhibitCache, 0, 16384);
+				if (map) {
+					volatile uint32_t *fb = (volatile uint32_t *)map->getVirtualAddress();
+					// Write white (0xFFFFFFFF) to first 4096 pixels = 16384 bytes
+					for (int px = 0; px < 4096; px++) {
+						fb[px] = 0xFFFFFFFF;  // XRGB white
+					}
+					SYSLOG("ngreen", "V76[%d]: WROTE 4096 white pixels at phys=0x%llx VA=0x%llx",
+						   v60Count, (unsigned long long)physAddr,
+						   (unsigned long long)map->getVirtualAddress());
+					map->release();
+				} else {
+					SYSLOG("ngreen", "V76[%d]: createMapping FAILED for phys=0x%llx", v60Count,
+						   (unsigned long long)physAddr);
+				}
+				desc->release();
+			} else {
+				SYSLOG("ngreen", "V76[%d]: IOMemoryDescriptor FAILED for phys=0x%llx", v60Count,
+					   (unsigned long long)physAddr);
+			}
+		} else {
+			SYSLOG("ngreen", "V76[%d]: SURF PTE invalid — cannot test framebuffer write", v60Count);
+		}
+	}
+
 	// ── V68: Iteration 5 — deep probe e08obj + GGTT PTE check ──
 	// V67 proved: sched error clear sticks, but hardware ERROR_GEN6=0x7b recurs
 	// every ~10s independently. Need to find WHAT generates the error.
