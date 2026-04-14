@@ -4196,10 +4196,19 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 	// V69: Diagnostic hook — original crashes at +0x4c writing 0x44 bytes to buffer+0xD000.
 	// That page is unmapped (CPU page fault, type 14). We replace the entire function body
 	// to prevent the panic and log the buffer state for root-cause analysis.
+	// V73: Fixed double-dereference bug — *getMember<T*> reads a pointer then follows it.
+	//      Use getMember<T> to write to object fields directly.
+	//      Added NULL guard for `that` (crash seen with RDI=0x0).
+
+	if (!that) {
+		SYSLOG("ngreen", "V73: IGHardwareBlit3DContext::initialize called with NULL this!");
+		return;
+	}
+
 	SYSLOG("ngreen", "V69: IGHardwareBlit3DContext::initialize(%p)", that);
 
 	// Dump context object internals — look for the GPU buffer mapping info
-	void *mappedBufPtr = *getMember<void **>(that, 0xd8);
+	void *mappedBufPtr = getMember<void *>(that, 0xd8);
 	SYSLOG("ngreen", "V69: ctx->0xd8(IGMappedBuffer)=%p", mappedBufPtr);
 
 	// Probe IGMappedBuffer internals: vtable, size, IOMemoryDescriptor*, base VA, etc.
@@ -4218,20 +4227,20 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 		}
 	}
 
-	// Zero internal fields — safe, these are C++ object members not GPU memory
-	*getMember<uint64_t *>(that, 0xe8) = 0;
-	*getMember<uint64_t *>(that, 0xf0) = 0;
-	*getMember<uint64_t *>(that, 0x100) = 0;
-	*getMember<uint64_t *>(that, 0xf8) = 0;
-	*getMember<uint64_t *>(that, 0x108) = 0;
-	*getMember<uint32_t *>(that, 0x110) = 0;
+	// V73: Zero internal fields directly — write to the object at these offsets.
+	// Previous code used *getMember<uint64_t *> which double-dereferenced:
+	// read pointer from field, then write to where it points → NULL deref crash.
+	getMember<uint64_t>(that, 0xe8) = 0;
+	getMember<uint64_t>(that, 0xf0) = 0;
+	getMember<uint64_t>(that, 0x100) = 0;
+	getMember<uint64_t>(that, 0xf8) = 0;
+	getMember<uint64_t>(that, 0x108) = 0;
+	getMember<uint32_t>(that, 0x110) = 0;
 
 	// DO NOT call original — crashes at initialize()+0x4c writing to unmapped page 0xD
 	// DO NOT call blit3d_initialize_scratch_space / blit3d_init_ctx — their hooks are not
 	// connected so oblit3d_init_ctx=0 → FunctionCast to addr 0 → instant crash
 	SYSLOG("ngreen", "V69: initialize complete (SKIPPED original — crash prevention)");
-	// Result: blit3D context partially initialized. Metal commands using it will fail
-	// but not kernel-panic. The GPU buffer mapping issue needs separate investigation.
 
 }
 
