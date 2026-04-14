@@ -1568,11 +1568,11 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 	
-	// V77: Fallback — terminate IOAccelDisplayPipeUserClient2 children if they exist.
-	// Primary fix: DisplayPipeSupported=0 in accelerator properties (set in start()).
-	// This fallback catches cases where IOAccelerator2D ignores the property and
-	// creates display pipe user clients anyway.
-	if (v60Count >= 2 && v60Count <= 15) {
+	// V78: Terminate IOAccelDisplayPipeUserClient2 children on EVERY iteration.
+	// V77 only scanned iterations 2-15, but the client appeared at iter 54.
+	// WindowServer crash-loops in RunFullDisplayPipe when GPU can't render.
+	// Must kill these clients whenever they appear, throughout all 60 iterations.
+	{
 		OSIterator *dpIter = svc->getClientIterator();
 		if (dpIter) {
 			OSObject *dpObj;
@@ -2680,6 +2680,25 @@ bool Gen11::start(void *that,void  *param_1)
 				if (pn) { cfpi->setObject("ACCF0000-0000-0000-0000-000a2789904e", pn); pn->release(); }
 				accelSvc->setProperty("IOCFPlugInTypes", cfpi);
 				cfpi->release();
+			}
+		}
+		
+		// V78: Set DisplayPipeSupported=0 UNCONDITIONALLY on accelerator service.
+		// V77 only set this inside if(!hasMetal) which never fires when personality
+		// already provides MetalPluginName. The IOAccelerator2D.plugin reads this
+		// property to decide whether to create IOAccelDisplayPipeUserClient2.
+		// Without GPU command submission working, display pipe compositing crashes
+		// WindowServer in CoreDisplay::DisplayPipe::RunFullDisplayPipe (NULL deref).
+		{
+			auto *dpCaps = OSDictionary::withCapacity(2);
+			if (dpCaps) {
+				auto *dpSupp = OSNumber::withNumber(0ULL, 32);
+				auto *trSupp = OSNumber::withNumber(0ULL, 32);
+				if (dpSupp) { dpCaps->setObject("DisplayPipeSupported", dpSupp); dpSupp->release(); }
+				if (trSupp) { dpCaps->setObject("TransactionsSupported", trSupp); trSupp->release(); }
+				accelSvc->setProperty("IOAccelDisplayPipeCapabilities", dpCaps);
+				dpCaps->release();
+				SYSLOG("ngreen", "V78: DisplayPipeSupported=0 set on accelerator service");
 			}
 		}
 		
