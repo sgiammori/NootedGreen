@@ -1983,37 +1983,41 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	// V82 proved: display engine reads from PLANE_SURF via GGTT (magenta visible).
 	// V83 bug: SURF redirect to GGTT page 0 → MCE at phys 0x3e800000 (stolen mem base).
 	// MC Bank 11 (GPU) uncorrected error on all 20 CPUs. NEVER touch stolen base.
-	// V84: Fill page-by-page on EVERY iteration (1-30) for persistence.
-	// No PTE cloning, no SURF redirect. Fill 1000 pages = ~400 rows.
+	// V85: Disable PSR/FBC + persistent fill + SURF re-arm
+	// V84 proved: magenta fill works (V76 readback = 0xffff00ff), tiling hooks
+	// NEVER fire (driver already sets linear), V80 never triggers.
+	// But user sees BARS. PSR (Panel Self-Refresh) cached the BIOS framebuffer
+	// (X-tiled, read as linear = bars). Our physical memory writes are invisible
+	// to PSR. V85: Disable PSR + FBC, re-arm SURF after fill.
 
 	if (v60Count >= 1 && v60Count <= 30) {
-		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C);
-		uint32_t surfPage = surfAddr >> 12;
-
-		// Iteration 1: PTE dump for layout analysis
-		if (v60Count == 1) {
-			SYSLOG("ngreen", "V84[1]: SURF=0x%x surfPage=0x%x", surfAddr, surfPage);
-			for (int p = 0; p < 10; p++) {
-				uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPage + p));
-				uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(surfPage + p));
-				uint64_t phys = (((uint64_t)hi << 32) | lo) & 0x0000FFFFFFFFF000ULL;
-				SYSLOG("ngreen", "V84[1]: SURF+%d PTE=0x%x:%08x phys=0x%llx v=%d",
-					   p, hi, lo, (unsigned long long)phys, lo & 1);
-			}
+		// 1. Disable PSR and FBC every iteration
+		uint32_t psrCtl = NGreen::callback->readReg32(0x64800);  // EDP_PSR_CTL
+		uint32_t psr2Ctl = NGreen::callback->readReg32(0x64900); // EDP_PSR2_CTL
+		uint32_t fbcCtl = NGreen::callback->readReg32(0x43208);  // DPFC_CONTROL
+		if (psrCtl & 0x80000000u)
+			NGreen::callback->writeReg32(0x64800, psrCtl & ~0x80000000u);
+		if (psr2Ctl & 0x1u)
+			NGreen::callback->writeReg32(0x64900, psr2Ctl & ~0x1u);
+		if (fbcCtl & 0x80000000u)
+			NGreen::callback->writeReg32(0x43208, fbcCtl & ~0x80000000u);
+		if (v60Count <= 3) {
+			SYSLOG("ngreen", "V85[%d]: PSR=0x%x PSR2=0x%x FBC=0x%x",
+				   v60Count, psrCtl, psr2Ctl, fbcCtl);
 		}
 
-		// Fill 1000 pages (= ~400 rows of 2560*4=10240 bytes/row, 4096/10240 ≈ 0.4 rows/page)
-		// Skip pages whose physical address is in stolen memory base (< 0x40000000)
-		// to avoid MCE. Only fill pages in high memory.
+		// 2. Fill framebuffer page-by-page with magenta
+		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C);
+		uint32_t surfPage = surfAddr >> 12;
 		int filled = 0, failed = 0, skipped = 0;
 		uint32_t firstPx = 0;
+		uint64_t firstPhys = 0;
 
 		for (int p = 0; p < 1000; p++) {
 			uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPage + p));
 			uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(surfPage + p));
 			uint64_t phys = (((uint64_t)hi << 32) | lo) & 0x0000FFFFFFFFF000ULL;
 			if (!(lo & 1) || phys == 0) { failed++; continue; }
-			// Skip stolen memory region to prevent MCE
 			if (phys < 0x40000000ULL) { skipped++; continue; }
 
 			auto *desc = IOMemoryDescriptor::withPhysicalAddress(
@@ -2023,18 +2027,31 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 				kIOMapAnywhere | kIOMapInhibitCache, 0, 4096);
 			if (map) {
 				volatile uint32_t *fb = (volatile uint32_t *)map->getVirtualAddress();
-				if (p == 0 && v60Count <= 3)
-					firstPx = fb[0]; // readback before fill
+				if (p == 0) {
+					firstPx = fb[0];
+					firstPhys = phys;
+					if (!v85PersistMap && v60Count >= 3) {
+						v85PersistMap = desc->createMappingInTask(kernel_task, 0,
+							kIOMapAnywhere | kIOMapInhibitCache, 0, 4096);
+						v85SurfAddr = surfAddr;
+					}
+				}
 				for (int px = 0; px < 1024; px++)
-					fb[px] = 0xFFFF00FF; // magenta
+					fb[px] = 0xFFFF00FF;
 				filled++;
 				map->release();
 			} else { failed++; }
 			desc->release();
 		}
+
+		// 3. Re-arm PLANE_SURF to invalidate PSR/FBC cache
+		if (filled > 0)
+			NGreen::callback->writeReg32(0x7019C, surfAddr);
+
 		if (v60Count <= 3 || v60Count == 10 || v60Count == 20) {
-			SYSLOG("ngreen", "V84[%d]: filled %d pages, failed %d, skipped %d, px[0]was=0x%x",
-				   v60Count, filled, failed, skipped, firstPx);
+			SYSLOG("ngreen", "V85[%d]: SURF=0x%x filled=%d fail=%d skip=%d px0=0x%x phys=0x%llx",
+				   v60Count, surfAddr, filled, failed, skipped, firstPx,
+				   (unsigned long long)firstPhys);
 		}
 	}
 
@@ -2192,6 +2209,27 @@ void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param
 						   v71Count, tilingBits, planStrd, expectedStride, width);
 				}
 			}
+
+			// V85: Fast persistent fill — re-fill page 0 + disable PSR every 50ms
+			// This combats the driver overwriting the FB with black at 60Hz
+			{
+				// Disable PSR/FBC continuously
+				uint32_t psrCtl = NGreen::callback->readReg32(0x64800);
+				uint32_t psr2Ctl = NGreen::callback->readReg32(0x64900);
+				if (psrCtl & 0x80000000u)
+					NGreen::callback->writeReg32(0x64800, psrCtl & ~0x80000000u);
+				if (psr2Ctl & 0x1u)
+					NGreen::callback->writeReg32(0x64900, psr2Ctl & ~0x1u);
+
+				// Fill page 0 from persistent mapping (set up by 2s timer)
+				if (v85PersistMap) {
+					volatile uint32_t *fb = (volatile uint32_t *)v85PersistMap->getVirtualAddress();
+					for (int px = 0; px < 1024; px++)
+						fb[px] = 0xFFFF00FF;
+					// Re-arm SURF to flush display cache
+					NGreen::callback->writeReg32(0x7019C, v85SurfAddr);
+				}
+			}
 		}
 	}
 
@@ -2204,6 +2242,10 @@ void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param
 		thread_call_enter_delayed(nextTimer, deadline);
 	}
 }
+
+// V85: Static member definitions for persistent FB mapping
+IOMemoryMap *Gen11::v85PersistMap = nullptr;
+uint32_t Gen11::v85SurfAddr = 0;
 
 // V54: IRQ watchdog — re-enables Master IRQ if the driver disables it during init.
 // Fires every 2s, up to 5 times (10s total), then stops.
