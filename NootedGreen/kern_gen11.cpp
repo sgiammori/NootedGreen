@@ -1979,47 +1979,42 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 
-	// ── V83: Page-by-page framebuffer fill + SURF redirect test ──
+	// ── V84: Page-by-page framebuffer fill — persistent, no GGTT modification ──
 	// V82 proved: display engine reads from PLANE_SURF via GGTT (magenta visible).
-	// V82 bug: PTE cloning corrupted GGTT → vertical bars when other components
-	// wrote to the shared physical page. V76 also interfered (white pixel write).
-	// V83: Fill each GGTT page individually with magenta (no PTE modification).
-	// Then test redirecting PLANE_SURF to stolen memory base (GGTT page 0)
-	// to see if WS/IOFramebuffer wrote content there.
+	// V83 bug: SURF redirect to GGTT page 0 → MCE at phys 0x3e800000 (stolen mem base).
+	// MC Bank 11 (GPU) uncorrected error on all 20 CPUs. NEVER touch stolen base.
+	// V84: Fill page-by-page on EVERY iteration (1-30) for persistence.
+	// No PTE cloning, no SURF redirect. Fill 1000 pages = ~400 rows.
 
-	// Iteration 1: Dump original PTEs for SURF pages 0-9
-	if (v60Count == 1) {
+	if (v60Count >= 1 && v60Count <= 30) {
 		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C);
 		uint32_t surfPage = surfAddr >> 12;
-		SYSLOG("ngreen", "V83[1]: SURF=0x%x surfPage=0x%x", surfAddr, surfPage);
-		for (int p = 0; p < 10; p++) {
-			uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPage + p));
-			uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(surfPage + p));
-			uint64_t phys = (((uint64_t)hi << 32) | lo) & 0x0000FFFFFFFFF000ULL;
-			SYSLOG("ngreen", "V83[1]: SURF+%d PTE=0x%x:%08x phys=0x%llx v=%d",
-				   p, hi, lo, (unsigned long long)phys, lo & 1);
-		}
-		// Also dump stolen memory base PTEs
-		for (int p = 0; p < 4; p++) {
-			uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(p));
-			uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(p));
-			SYSLOG("ngreen", "V83[1]: STOLEN[%d] PTE=0x%x:%08x", p, hi, lo);
-		}
-	}
 
-	// Iterations 2-10: Page-by-page magenta fill (250 pages = ~100 rows)
-	// Each page: read PTE → get phys → map 4KB → fill magenta → unmap
-	if (v60Count >= 2 && v60Count <= 10) {
-		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C);
-		uint32_t surfPage = surfAddr >> 12;
-		int filled = 0, failed = 0;
-		uint32_t firstPx = 0, lastPhys = 0;
+		// Iteration 1: PTE dump for layout analysis
+		if (v60Count == 1) {
+			SYSLOG("ngreen", "V84[1]: SURF=0x%x surfPage=0x%x", surfAddr, surfPage);
+			for (int p = 0; p < 10; p++) {
+				uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPage + p));
+				uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(surfPage + p));
+				uint64_t phys = (((uint64_t)hi << 32) | lo) & 0x0000FFFFFFFFF000ULL;
+				SYSLOG("ngreen", "V84[1]: SURF+%d PTE=0x%x:%08x phys=0x%llx v=%d",
+					   p, hi, lo, (unsigned long long)phys, lo & 1);
+			}
+		}
 
-		for (int p = 0; p < 250; p++) {
+		// Fill 1000 pages (= ~400 rows of 2560*4=10240 bytes/row, 4096/10240 ≈ 0.4 rows/page)
+		// Skip pages whose physical address is in stolen memory base (< 0x40000000)
+		// to avoid MCE. Only fill pages in high memory.
+		int filled = 0, failed = 0, skipped = 0;
+		uint32_t firstPx = 0;
+
+		for (int p = 0; p < 1000; p++) {
 			uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPage + p));
 			uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(surfPage + p));
 			uint64_t phys = (((uint64_t)hi << 32) | lo) & 0x0000FFFFFFFFF000ULL;
 			if (!(lo & 1) || phys == 0) { failed++; continue; }
+			// Skip stolen memory region to prevent MCE
+			if (phys < 0x40000000ULL) { skipped++; continue; }
 
 			auto *desc = IOMemoryDescriptor::withPhysicalAddress(
 				(IOPhysicalAddress)phys, 4096, kIODirectionInOut);
@@ -2028,53 +2023,19 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 				kIOMapAnywhere | kIOMapInhibitCache, 0, 4096);
 			if (map) {
 				volatile uint32_t *fb = (volatile uint32_t *)map->getVirtualAddress();
-				if (p == 0 && v60Count <= 5)
+				if (p == 0 && v60Count <= 3)
 					firstPx = fb[0]; // readback before fill
 				for (int px = 0; px < 1024; px++)
 					fb[px] = 0xFFFF00FF; // magenta
 				filled++;
-				lastPhys = (uint32_t)(phys >> 12);
 				map->release();
 			} else { failed++; }
 			desc->release();
 		}
-		if (v60Count <= 5) {
-			SYSLOG("ngreen", "V83[%d]: filled %d pages, failed %d, px[0]was=0x%x lastPhys=0x%x",
-				   v60Count, filled, failed, firstPx, lastPhys);
+		if (v60Count <= 3 || v60Count == 10 || v60Count == 20) {
+			SYSLOG("ngreen", "V84[%d]: filled %d pages, failed %d, skipped %d, px[0]was=0x%x",
+				   v60Count, filled, failed, skipped, firstPx);
 		}
-	}
-
-	// Iteration 15: Redirect PLANE_SURF to stolen memory base (GGTT page 0)
-	// Test if WS/IOFramebuffer wrote content to stolen memory
-	if (v60Count == 15) {
-		uint32_t oldSurf = NGreen::callback->readReg32(0x7019C);
-		// Read first pixel at stolen memory to preview
-		uint32_t stolenLo = NGreen::callback->readReg32(GGTT_PTE_LO(0));
-		uint32_t stolenHi = NGreen::callback->readReg32(GGTT_PTE_HI(0));
-		uint64_t stolenPhys = (((uint64_t)stolenHi << 32) | stolenLo) & 0x0000FFFFFFFFF000ULL;
-		uint32_t previewPx = 0;
-		if ((stolenLo & 1) && stolenPhys != 0) {
-			auto *desc = IOMemoryDescriptor::withPhysicalAddress(
-				(IOPhysicalAddress)stolenPhys, 4096, kIODirectionIn);
-			if (desc) {
-				auto *map = desc->createMappingInTask(kernel_task, 0,
-					kIOMapAnywhere | kIOMapInhibitCache, 0, 4096);
-				if (map) {
-					previewPx = *(volatile uint32_t *)map->getVirtualAddress();
-					map->release();
-				}
-				desc->release();
-			}
-		}
-		SYSLOG("ngreen", "V83[15]: redirect SURF 0x%x->0x0 stolenPhys=0x%llx px[0]=0x%x",
-			   oldSurf, (unsigned long long)stolenPhys, previewPx);
-		NGreen::callback->writeReg32(0x7019C, 0x0); // Point SURF to GGTT page 0
-	}
-
-	// Iteration 20: Restore original PLANE_SURF
-	if (v60Count == 20) {
-		NGreen::callback->writeReg32(0x7019C, 0x4224d000);
-		SYSLOG("ngreen", "V83[20]: restored SURF=0x4224d000");
 	}
 
 	// ── V68: Iteration 5 — deep probe e08obj + GGTT PTE check ──
