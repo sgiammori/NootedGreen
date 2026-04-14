@@ -1983,37 +1983,73 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	// V82 proved: display engine reads from PLANE_SURF via GGTT (magenta visible).
 	// V83 bug: SURF redirect to GGTT page 0 → MCE at phys 0x3e800000 (stolen mem base).
 	// MC Bank 11 (GPU) uncorrected error on all 20 CPUs. NEVER touch stolen base.
-	// V85: Disable PSR/FBC + persistent fill + SURF re-arm
-	// V84 proved: magenta fill works (V76 readback = 0xffff00ff), tiling hooks
-	// NEVER fire (driver already sets linear), V80 never triggers.
-	// But user sees BARS. PSR (Panel Self-Refresh) cached the BIOS framebuffer
-	// (X-tiled, read as linear = bars). Our physical memory writes are invisible
-	// to PSR. V85: Disable PSR + FBC, re-arm SURF after fill.
+	// V86: Full plane diagnostic + overlay disable + full-screen fill + format fix
+	// V85 proved: PSR/FBC were NEVER enabled (PSR=0x80, FBC=0x40000000 — bit 31 NOT set).
+	// Magenta fill persists (px0=0xffff00ff at iter 10,20). GPU render engine active
+	// (HEAD/TAIL moving). But user sees BARS. Hypothesis: another plane (2-7)
+	// on top of plane 1, OR format mismatch in PLANE_CTL.
 
 	if (v60Count >= 1 && v60Count <= 30) {
-		// 1. Disable PSR and FBC every iteration
-		uint32_t psrCtl = NGreen::callback->readReg32(0x64800);  // EDP_PSR_CTL
-		uint32_t psr2Ctl = NGreen::callback->readReg32(0x64900); // EDP_PSR2_CTL
-		uint32_t fbcCtl = NGreen::callback->readReg32(0x43208);  // DPFC_CONTROL
-		if (psrCtl & 0x80000000u)
-			NGreen::callback->writeReg32(0x64800, psrCtl & ~0x80000000u);
-		if (psr2Ctl & 0x1u)
-			NGreen::callback->writeReg32(0x64900, psr2Ctl & ~0x1u);
-		if (fbcCtl & 0x80000000u)
-			NGreen::callback->writeReg32(0x43208, fbcCtl & ~0x80000000u);
+		// 1. Scan ALL planes on Pipe A (planes 1-7) + cursor
+		// Plane N: CTL = 0x70080 + N*0x100, SURF = 0x7009C + N*0x100
+		// Higher plane number = rendered ON TOP of lower. Cursor at 0x70080.
 		if (v60Count <= 3) {
-			SYSLOG("ngreen", "V85[%d]: PSR=0x%x PSR2=0x%x FBC=0x%x",
-				   v60Count, psrCtl, psr2Ctl, fbcCtl);
+			uint32_t curCtl = NGreen::callback->readReg32(0x70080);  // CUR_CTL
+			uint32_t curSurf = NGreen::callback->readReg32(0x70084); // CUR_BASE (or CUR_SURF)
+			SYSLOG("ngreen", "V86[%d]: CUR_CTL=0x%x CUR_SURF=0x%x", v60Count, curCtl, curSurf);
+
+			for (int pn = 1; pn <= 7; pn++) {
+				uint32_t plCtl = NGreen::callback->readReg32(0x70080 + pn * 0x100);
+				uint32_t plSurf = NGreen::callback->readReg32(0x7009C + pn * 0x100);
+				uint32_t plStride = NGreen::callback->readReg32(0x70088 + pn * 0x100);
+				uint32_t plSize = NGreen::callback->readReg32(0x70090 + pn * 0x100);
+				if (plCtl & 0x80000000u) {
+					SYSLOG("ngreen", "V86[%d]: PLANE%d ACTIVE CTL=0x%x SURF=0x%x STR=0x%x SZ=0x%x",
+						   v60Count, pn, plCtl, plSurf, plStride, plSize);
+				} else if (pn <= 3) {
+					SYSLOG("ngreen", "V86[%d]: PLANE%d off CTL=0x%x", v60Count, pn, plCtl);
+				}
+			}
 		}
 
-		// 2. Fill framebuffer page-by-page with magenta
+		// 2. DISABLE planes 2-7 if active — they render on top of plane 1
+		for (int pn = 2; pn <= 7; pn++) {
+			uint32_t plCtl = NGreen::callback->readReg32(0x70080 + pn * 0x100);
+			if (plCtl & 0x80000000u) {
+				NGreen::callback->writeReg32(0x70080 + pn * 0x100, plCtl & ~0x80000000u);
+				// Must write SURF to trigger the update (double-buffered)
+				uint32_t plSurf = NGreen::callback->readReg32(0x7009C + pn * 0x100);
+				NGreen::callback->writeReg32(0x7009C + pn * 0x100, plSurf);
+			}
+		}
+		// Disable cursor plane if active
+		uint32_t curCtl = NGreen::callback->readReg32(0x70080);
+		if (curCtl & 0x80000000u) {
+			// Don't disable cursor — it proves WS is alive. Just log it.
+			if (v60Count <= 3)
+				SYSLOG("ngreen", "V86[%d]: cursor ACTIVE (keeping)", v60Count);
+		}
+
+		// 3. Fix PLANE_CTL format: force XRGB 8888 (format=0x2) instead of
+		//    current format 0x4 (XRGB 2:10:10:10). Keep all other bits.
+		uint32_t planCtl = NGreen::callback->readReg32(0x70180);
+		uint32_t curFmt = (planCtl >> 24) & 0xF;
+		if (curFmt != 0x2) {
+			uint32_t newCtl = (planCtl & ~(0xFu << 24)) | (0x2u << 24);
+			NGreen::callback->writeReg32(0x70180, newCtl);
+			if (v60Count <= 5)
+				SYSLOG("ngreen", "V86[%d]: format fix 0x%x->0x%x (fmt %d->2)",
+					   v60Count, planCtl, newCtl, curFmt);
+		}
+
+		// 4. Fill framebuffer — ALL 4000 pages (covers full 2560x1600x4 = 16MB)
 		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C);
 		uint32_t surfPage = surfAddr >> 12;
 		int filled = 0, failed = 0, skipped = 0;
-		uint32_t firstPx = 0;
+		uint32_t firstPx = 0, midPx = 0;
 		uint64_t firstPhys = 0;
 
-		for (int p = 0; p < 1000; p++) {
+		for (int p = 0; p < 4000; p++) {
 			uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPage + p));
 			uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(surfPage + p));
 			uint64_t phys = (((uint64_t)hi << 32) | lo) & 0x0000FFFFFFFFF000ULL;
@@ -2036,6 +2072,8 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 						v85SurfAddr = surfAddr;
 					}
 				}
+				if (p == 2000)
+					midPx = fb[0];
 				for (int px = 0; px < 1024; px++)
 					fb[px] = 0xFFFF00FF;
 				filled++;
@@ -2044,13 +2082,13 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 			desc->release();
 		}
 
-		// 3. Re-arm PLANE_SURF to invalidate PSR/FBC cache
+		// 5. Re-arm PLANE_SURF to commit updates
 		if (filled > 0)
 			NGreen::callback->writeReg32(0x7019C, surfAddr);
 
-		if (v60Count <= 3 || v60Count == 10 || v60Count == 20) {
-			SYSLOG("ngreen", "V85[%d]: SURF=0x%x filled=%d fail=%d skip=%d px0=0x%x phys=0x%llx",
-				   v60Count, surfAddr, filled, failed, skipped, firstPx,
+		if (v60Count <= 5 || v60Count == 10 || v60Count == 20) {
+			SYSLOG("ngreen", "V86[%d]: SURF=0x%x filled=%d fail=%d skip=%d px0=0x%x mid=0x%x phys=0x%llx",
+				   v60Count, surfAddr, filled, failed, skipped, firstPx, midPx,
 				   (unsigned long long)firstPhys);
 		}
 	}
@@ -2210,23 +2248,31 @@ void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param
 				}
 			}
 
-			// V85: Fast persistent fill — re-fill page 0 + disable PSR every 50ms
-			// This combats the driver overwriting the FB with black at 60Hz
+			// V86: Fast persistent fill + overlay disable + format fix every 50ms
 			{
-				// Disable PSR/FBC continuously
-				uint32_t psrCtl = NGreen::callback->readReg32(0x64800);
-				uint32_t psr2Ctl = NGreen::callback->readReg32(0x64900);
-				if (psrCtl & 0x80000000u)
-					NGreen::callback->writeReg32(0x64800, psrCtl & ~0x80000000u);
-				if (psr2Ctl & 0x1u)
-					NGreen::callback->writeReg32(0x64900, psr2Ctl & ~0x1u);
+				// Disable overlay planes 2-7 continuously
+				for (int pn = 2; pn <= 7; pn++) {
+					uint32_t plCtl = NGreen::callback->readReg32(0x70080 + pn * 0x100);
+					if (plCtl & 0x80000000u) {
+						NGreen::callback->writeReg32(0x70080 + pn * 0x100, plCtl & ~0x80000000u);
+						uint32_t plSurf = NGreen::callback->readReg32(0x7009C + pn * 0x100);
+						NGreen::callback->writeReg32(0x7009C + pn * 0x100, plSurf);
+					}
+				}
+				// Fix PLANE_CTL format to XRGB 8888 (format=2)
+				uint32_t planCtl = NGreen::callback->readReg32(0x70180);
+				uint32_t curFmt = (planCtl >> 24) & 0xF;
+				if (curFmt != 0x2) {
+					uint32_t newCtl = (planCtl & ~(0xFu << 24)) | (0x2u << 24);
+					NGreen::callback->writeReg32(0x70180, newCtl);
+				}
 
-				// Fill page 0 from persistent mapping (set up by 2s timer)
+				// Fill page 0 from persistent mapping
 				if (v85PersistMap) {
 					volatile uint32_t *fb = (volatile uint32_t *)v85PersistMap->getVirtualAddress();
 					for (int px = 0; px < 1024; px++)
 						fb[px] = 0xFFFF00FF;
-					// Re-arm SURF to flush display cache
+					// Re-arm SURF
 					NGreen::callback->writeReg32(0x7019C, v85SurfAddr);
 				}
 			}
