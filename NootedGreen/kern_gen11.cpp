@@ -1957,100 +1957,124 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		SYSLOG("ngreen", "V76[%d]: GAMMA idx_was=0x%x g[0]=0x%x g[128]=0x%x g[255]=0x%x",
 			   v60Count, gammaIdx, gamma0, gamma128, gamma255);
 
-		// 6. Framebuffer physical write test — write white pixels to the first
-		// 64 rows of the display surface to prove the display pipeline works.
-		// This uses IOMemoryDescriptor to map the physical stolen memory page.
+		// 6. Framebuffer physical read test — read pixels from the display surface
+		// to check current content. V83 handles filling; V76 only reads now.
 		if (pteValid && physAddr != 0) {
-			// Map 64 rows: stride=10240 bytes (0xa0*64), 64 rows = 655360 bytes
-			// But just map first 4 pages (16KB) for a minimal test = ~1.5 rows
 			auto *desc = IOMemoryDescriptor::withPhysicalAddress(
-				(IOPhysicalAddress)physAddr, 16384, kIODirectionInOut);
+				(IOPhysicalAddress)physAddr, 4096, kIODirectionIn);
 			if (desc) {
 				auto *map = desc->createMappingInTask(kernel_task, 0,
-					kIOMapAnywhere | kIOMapInhibitCache, 0, 16384);
+					kIOMapAnywhere | kIOMapInhibitCache, 0, 4096);
 				if (map) {
 					volatile uint32_t *fb = (volatile uint32_t *)map->getVirtualAddress();
-					// Write white (0xFFFFFFFF) to first 4096 pixels = 16384 bytes
-					for (int px = 0; px < 4096; px++) {
-						fb[px] = 0xFFFFFFFF;  // XRGB white
-					}
-					SYSLOG("ngreen", "V76[%d]: WROTE 4096 white pixels at phys=0x%llx VA=0x%llx",
-						   v60Count, (unsigned long long)physAddr,
-						   (unsigned long long)map->getVirtualAddress());
-					map->release();
-				} else {
-					SYSLOG("ngreen", "V76[%d]: createMapping FAILED for phys=0x%llx", v60Count,
+					SYSLOG("ngreen", "V76[%d]: READ px[0]=0x%x px[512]=0x%x px[1023]=0x%x phys=0x%llx",
+						   v60Count, fb[0], fb[512], fb[1023],
 						   (unsigned long long)physAddr);
+					map->release();
 				}
 				desc->release();
-			} else {
-				SYSLOG("ngreen", "V76[%d]: IOMemoryDescriptor FAILED for phys=0x%llx", v60Count,
-					   (unsigned long long)physAddr);
 			}
 		} else {
-			SYSLOG("ngreen", "V76[%d]: SURF PTE invalid — cannot test framebuffer write", v60Count);
+			SYSLOG("ngreen", "V76[%d]: SURF PTE invalid — cannot read framebuffer", v60Count);
 		}
 	}
 
-	// ── V82: GGTT PTE cloning — full-screen magenta framebuffer test ──
-	// V81 bug: mapped 256KB contiguously from first PTE physAddr, but GGTT pages
-	// are NOT contiguous after page 3. Only ~12KB (1.2 rows) was valid.
-	// V82 fix: Fill page 0 with magenta, then CLONE its PTE across all 4000
-	// framebuffer pages so the display resolves every page to the same
-	// magenta-filled physical page. Also reduced logging to prevent APFS panic.
-	static IOMemoryMap *v82FbMap = nullptr;
+	// ── V83: Page-by-page framebuffer fill + SURF redirect test ──
+	// V82 proved: display engine reads from PLANE_SURF via GGTT (magenta visible).
+	// V82 bug: PTE cloning corrupted GGTT → vertical bars when other components
+	// wrote to the shared physical page. V76 also interfered (white pixel write).
+	// V83: Fill each GGTT page individually with magenta (no PTE modification).
+	// Then test redirecting PLANE_SURF to stolen memory base (GGTT page 0)
+	// to see if WS/IOFramebuffer wrote content there.
 
-	if (v60Count == 2) {
-		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
+	// Iteration 1: Dump original PTEs for SURF pages 0-9
+	if (v60Count == 1) {
+		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C);
 		uint32_t surfPage = surfAddr >> 12;
-		uint32_t pteLo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPage));
-		uint32_t pteHi = NGreen::callback->readReg32(GGTT_PTE_HI(surfPage));
-		uint64_t pte = ((uint64_t)pteHi << 32) | pteLo;
-		uint64_t physAddr = pte & 0x0000FFFFFFFFF000ULL;
-		bool pteValid = (pteLo & 0x1) != 0;
+		SYSLOG("ngreen", "V83[1]: SURF=0x%x surfPage=0x%x", surfAddr, surfPage);
+		for (int p = 0; p < 10; p++) {
+			uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPage + p));
+			uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(surfPage + p));
+			uint64_t phys = (((uint64_t)hi << 32) | lo) & 0x0000FFFFFFFFF000ULL;
+			SYSLOG("ngreen", "V83[1]: SURF+%d PTE=0x%x:%08x phys=0x%llx v=%d",
+				   p, hi, lo, (unsigned long long)phys, lo & 1);
+		}
+		// Also dump stolen memory base PTEs
+		for (int p = 0; p < 4; p++) {
+			uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(p));
+			uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(p));
+			SYSLOG("ngreen", "V83[1]: STOLEN[%d] PTE=0x%x:%08x", p, hi, lo);
+		}
+	}
 
-		if (pteValid && physAddr != 0) {
-			// Map page 0 physical address (4KB = 1024 pixels)
+	// Iterations 2-10: Page-by-page magenta fill (250 pages = ~100 rows)
+	// Each page: read PTE → get phys → map 4KB → fill magenta → unmap
+	if (v60Count >= 2 && v60Count <= 10) {
+		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C);
+		uint32_t surfPage = surfAddr >> 12;
+		int filled = 0, failed = 0;
+		uint32_t firstPx = 0, lastPhys = 0;
+
+		for (int p = 0; p < 250; p++) {
+			uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPage + p));
+			uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(surfPage + p));
+			uint64_t phys = (((uint64_t)hi << 32) | lo) & 0x0000FFFFFFFFF000ULL;
+			if (!(lo & 1) || phys == 0) { failed++; continue; }
+
 			auto *desc = IOMemoryDescriptor::withPhysicalAddress(
-				(IOPhysicalAddress)physAddr, 4096, kIODirectionInOut);
+				(IOPhysicalAddress)phys, 4096, kIODirectionInOut);
+			if (!desc) { failed++; continue; }
+			auto *map = desc->createMappingInTask(kernel_task, 0,
+				kIOMapAnywhere | kIOMapInhibitCache, 0, 4096);
+			if (map) {
+				volatile uint32_t *fb = (volatile uint32_t *)map->getVirtualAddress();
+				if (p == 0 && v60Count <= 5)
+					firstPx = fb[0]; // readback before fill
+				for (int px = 0; px < 1024; px++)
+					fb[px] = 0xFFFF00FF; // magenta
+				filled++;
+				lastPhys = (uint32_t)(phys >> 12);
+				map->release();
+			} else { failed++; }
+			desc->release();
+		}
+		if (v60Count <= 5) {
+			SYSLOG("ngreen", "V83[%d]: filled %d pages, failed %d, px[0]was=0x%x lastPhys=0x%x",
+				   v60Count, filled, failed, firstPx, lastPhys);
+		}
+	}
+
+	// Iteration 15: Redirect PLANE_SURF to stolen memory base (GGTT page 0)
+	// Test if WS/IOFramebuffer wrote content to stolen memory
+	if (v60Count == 15) {
+		uint32_t oldSurf = NGreen::callback->readReg32(0x7019C);
+		// Read first pixel at stolen memory to preview
+		uint32_t stolenLo = NGreen::callback->readReg32(GGTT_PTE_LO(0));
+		uint32_t stolenHi = NGreen::callback->readReg32(GGTT_PTE_HI(0));
+		uint64_t stolenPhys = (((uint64_t)stolenHi << 32) | stolenLo) & 0x0000FFFFFFFFF000ULL;
+		uint32_t previewPx = 0;
+		if ((stolenLo & 1) && stolenPhys != 0) {
+			auto *desc = IOMemoryDescriptor::withPhysicalAddress(
+				(IOPhysicalAddress)stolenPhys, 4096, kIODirectionIn);
 			if (desc) {
-				v82FbMap = desc->createMappingInTask(kernel_task, 0,
+				auto *map = desc->createMappingInTask(kernel_task, 0,
 					kIOMapAnywhere | kIOMapInhibitCache, 0, 4096);
-				if (v82FbMap) {
-					volatile uint32_t *fb = (volatile uint32_t *)v82FbMap->getVirtualAddress();
-					SYSLOG("ngreen", "V82[2]: SURF=0x%x phys=0x%llx PRE px[0]=0x%x px[512]=0x%x",
-						   surfAddr, (unsigned long long)physAddr, fb[0], fb[512]);
-					// Fill 1024 pixels with magenta
-					for (int px = 0; px < 1024; px++)
-						fb[px] = 0xFFFF00FF;
+				if (map) {
+					previewPx = *(volatile uint32_t *)map->getVirtualAddress();
+					map->release();
 				}
 				desc->release();
 			}
-
-			// Clone PTE to pages 1-3999: entire 2560x1600 framebuffer
-			// Every page resolves to the same magenta physical page
-			for (int p = 1; p <= 3999; p++) {
-				NGreen::callback->writeReg32(GGTT_PTE_LO(surfPage + p), pteLo);
-				NGreen::callback->writeReg32(GGTT_PTE_HI(surfPage + p), pteHi);
-			}
-			// Re-arm PLANE_SURF to force display engine to re-walk GGTT
-			NGreen::callback->writeReg32(0x7019C, surfAddr);
-			SYSLOG("ngreen", "V82[2]: cloned PTE to 3999 pages, SURF re-armed");
 		}
+		SYSLOG("ngreen", "V83[15]: redirect SURF 0x%x->0x0 stolenPhys=0x%llx px[0]=0x%x",
+			   oldSurf, (unsigned long long)stolenPhys, previewPx);
+		NGreen::callback->writeReg32(0x7019C, 0x0); // Point SURF to GGTT page 0
 	}
 
-	if (v60Count >= 3 && v60Count <= 5 && v82FbMap) {
-		volatile uint32_t *fb = (volatile uint32_t *)v82FbMap->getVirtualAddress();
-		SYSLOG("ngreen", "V82[%d]: readback px[0]=0x%x px[512]=0x%x",
-			   v60Count, fb[0], fb[512]);
-		// Re-fill in case WS or driver overwrites
-		for (int px = 0; px < 1024; px++)
-			fb[px] = 0xFFFF00FF;
-	}
-
-	if (v60Count == 30 && v82FbMap) {
-		v82FbMap->release();
-		v82FbMap = nullptr;
+	// Iteration 20: Restore original PLANE_SURF
+	if (v60Count == 20) {
+		NGreen::callback->writeReg32(0x7019C, 0x4224d000);
+		SYSLOG("ngreen", "V83[20]: restored SURF=0x4224d000");
 	}
 
 	// ── V68: Iteration 5 — deep probe e08obj + GGTT PTE check ──
