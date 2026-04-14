@@ -1830,6 +1830,35 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 	
+	// ── V79: Force linear tiling on display plane ──
+	// V78 fixed WS crash-loop (DisplayPipeSupported=0). Screen now shows black/white
+	// bars because BIOS programmed PLANE_CTL with X-tiled (bits[12:10]=001) but
+	// CPU compositing writes linear pixel data. Reprogram to linear tiling.
+	if (v60Count <= 3) {
+		uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
+		uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
+		uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
+		if (tiling != 0) {
+			// Currently tiled — convert stride and clear tiling
+			uint32_t newCtl = planCtl & ~(0x7u << 10); // clear tiling → linear
+			uint32_t newStrd = planStrd;
+			if (tiling == 1) { // X-tiled: stride is in 512B units, linear needs 64B units
+				newStrd = planStrd * 8;
+			} else if (tiling == 4) { // Tile4: stride in tile rows, ×4 for 128B→64B then ×4 rows
+				newStrd = planStrd * 16;
+			}
+			NGreen::callback->writeReg32(0x70180, newCtl);   // PLANE_CTL
+			NGreen::callback->writeReg32(0x70188, newStrd);  // PLANE_STRIDE
+			// Write PLANE_SURF with same value to arm/latch the changes
+			uint32_t planSurf = NGreen::callback->readReg32(0x7019C);
+			NGreen::callback->writeReg32(0x7019C, planSurf); // PLANE_SURF (re-arm)
+			SYSLOG("ngreen", "V79[%d]: tiling %d→linear CTL 0x%x→0x%x STRIDE 0x%x→0x%x SURF=0x%x",
+				   v60Count, tiling, planCtl, newCtl, planStrd, newStrd, planSurf);
+		} else {
+			SYSLOG("ngreen", "V79[%d]: already linear CTL=0x%x STRIDE=0x%x", v60Count, planCtl, planStrd);
+		}
+	}
+
 	// ── V75: Display pipeline register dump — diagnose black screen ──
 	// System stays alive but display is black. Read pipe/plane/transcoder/backlight
 	// registers to understand what state the display hardware is in.
@@ -3510,8 +3539,8 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 		param_2 = linear;
 	}
 	if (param_1 == 0x70180) { // PLANE_CTL Pipe A Plane 1
-		param_2 &= ~(0x7u << 12); // clear tiling bits → linear
-		DBGLOG("ngreen", "PLANE_CTL fixup: forced linear tiling");
+		param_2 &= ~(0x7u << 10); // clear tiling bits[12:10] → linear (V79 fix: was <<12)
+		DBGLOG("ngreen", "PLANE_CTL fixup: forced linear tiling 0x%x", param_2);
 	}
 
 	if (reinterpret_cast<volatile uint64_t*>(that)==nullptr) return NGreen::callback->writeReg32(param_1,param_2);
