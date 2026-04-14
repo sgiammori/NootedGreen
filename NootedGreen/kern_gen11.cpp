@@ -1830,11 +1830,9 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 	
-	// ── V79: Force linear tiling on display plane ──
-	// V78 fixed WS crash-loop (DisplayPipeSupported=0). Screen now shows black/white
-	// bars because BIOS programmed PLANE_CTL with X-tiled (bits[12:10]=001) but
-	// CPU compositing writes linear pixel data. Reprogram to linear tiling.
-	if (v60Count <= 3) {
+	// ── V79: Force linear tiling on display plane (diagnostic logging) ──
+	// V80 does the actual enforcement in the 50ms EMR timer. V79 logs the state.
+	if (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30) {
 		uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
 		uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
 		uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
@@ -2113,6 +2111,42 @@ void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param
 	if (v71Count <= 3 || (emrRcs != 0xFFFFFFFF && v71Count <= 200)) {
 		SYSLOG("ngreen", "V74E[%d]: EMR_RCS=0x%x EMR_BCS=0x%x ERR=0x%x",
 			   v71Count, emrRcs, emrBcs, err);
+	}
+
+	// ── V80: Force linear tiling on display plane — 50ms enforcement ──
+	// V79 proved the writeReg32 hooks fix tiling, but the framebuffer driver
+	// writes PLANE_STRIDE via direct MMIO (bypassing hooks), resetting stride
+	// to X-tiled units. The display then shows bars because the stride is
+	// wrong for linear mode. Fix both tiling and stride every 50ms.
+	{
+		uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
+		bool planeEnabled = (planCtl >> 31) & 1;
+		if (planeEnabled) {
+			uint32_t tilingBits = (planCtl >> 10) & 0x7;
+			uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
+			// Compute expected linear stride from PIPE_SRC width
+			uint32_t pipeSrc = NGreen::callback->readReg32(0x6001C); // PIPE_SRCSZ_A
+			uint32_t width = ((pipeSrc >> 16) & 0xFFF) + 1;
+			uint32_t expectedStride = (width * 4) / 64; // XRGB8888, 64B cacheline units
+			bool needFix = false;
+			if (tilingBits != 0) {
+				NGreen::callback->writeReg32(0x70180, planCtl & ~(0x7u << 10));
+				needFix = true;
+			}
+			if (planStrd != expectedStride && expectedStride > 0) {
+				NGreen::callback->writeReg32(0x70188, expectedStride);
+				needFix = true;
+			}
+			if (needFix) {
+				// Re-arm PLANE_SURF to latch changes
+				uint32_t surf = NGreen::callback->readReg32(0x7019C);
+				NGreen::callback->writeReg32(0x7019C, surf);
+				if (v71Count <= 40) {
+					SYSLOG("ngreen", "V80[%d]: tiling=%d stride=0x%x->0x%x w=%d",
+						   v71Count, tilingBits, planStrd, expectedStride, width);
+				}
+			}
+		}
 	}
 
 	// V74: Re-arm FOREVER — never stop. 50ms interval.
@@ -3533,13 +3567,15 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 	// Without GPU acceleration, surfaces are linear but the driver computes
 	// Tile4 stride (÷512). Convert back to linear stride (÷64) = multiply by 8.
 	// PLANE_CTL bits[14:12] = tiling mode: force 000 (linear).
-	if (param_1 == 0x70188) { // PLANE_STRIDE Pipe A Plane 1
+	// V80: Use masked comparison to also catch raWriteRegister32b calls
+	// (where param_1 may be base_addr + offset instead of raw offset)
+	if ((param_1 & 0xFFFFF) == 0x70188) { // PLANE_STRIDE Pipe A Plane 1
 		UInt32 linear = param_2 * 8;
 		DBGLOG("ngreen", "PLANE_STRIDE fixup: 0x%x -> 0x%x (linear)", param_2, linear);
 		param_2 = linear;
 	}
-	if (param_1 == 0x70180) { // PLANE_CTL Pipe A Plane 1
-		param_2 &= ~(0x7u << 10); // clear tiling bits[12:10] → linear (V79 fix: was <<12)
+	if ((param_1 & 0xFFFFF) == 0x70180) { // PLANE_CTL Pipe A Plane 1
+		param_2 &= ~(0x7u << 10); // clear tiling bits[12:10] → linear
 		DBGLOG("ngreen", "PLANE_CTL fixup: forced linear tiling 0x%x", param_2);
 	}
 
@@ -4280,8 +4316,8 @@ void Gen11::FastWriteRegister32(void *that,unsigned long param_1,uint32_t param_
 		param_2 = linear;
 	}
 	if (param_1 == 0x70180) { // PLANE_CTL Pipe A Plane 1
-		param_2 &= ~(0x7u << 12); // clear tiling bits → linear
-		DBGLOG("ngreen", "FastWrite PLANE_CTL fixup: forced linear tiling");
+		param_2 &= ~(0x7u << 10); // clear tiling bits[12:10] → linear (V80 fix: was <<12)
+		DBGLOG("ngreen", "FastWrite PLANE_CTL fixup: forced linear tiling 0x%x", param_2);
 	}
 	return FunctionCast(FastWriteRegister32, callback->oFastWriteRegister32)(that,param_1,param_2 );
 }
