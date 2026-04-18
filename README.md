@@ -61,9 +61,21 @@ Without these properties on the active test setup, Lilu may not pick the intende
 | `-ngreenNoMetal` | Disable Metal rendering — stub out CoreDisplay Metal paths to prevent NULL MTLDevice crashes (display-only debug mode) |
 | `-ngreenAllowMetal` | Legacy flag (backward compat) — forces Metal ON, equivalent to not setting `-ngreenNoMetal` |
 | `-nbdyldoff` | **Disable ALL DYLD patches** (CoreDisplay, OpenGL, Metal, SkyLight) — debug only |
+| `-ngreenexp` / `ngreenexp=1` | Enable experimental runtime monitor/timer paths (disabled by default for compatibility) |
+| `-ngreenforceprops` / `ngreenforceprops=1` | Enable legacy forced IGPU property injection (`AAPL,ig-platform-id`, `model`, `saved-config`, etc.). Disabled by default in compatibility-first mode. |
 | `IGLogLevel=8` | Maximum Intel GPU driver logging |
 | `-liludbg` | Enable Lilu debug logging |
 | `liludump=60` | Dump Lilu logs after 60 seconds |
+
+## Compatibility-First Defaults
+
+Recent changes switch NootedGreen to safer defaults for cross-machine portability:
+
+- Legacy hardcoded IGPU property seeding is now **opt-in**, not default.
+- Experimental watchdog/monitor logic is now **opt-in** via `-ngreenexp`.
+- Coexistence paths avoid forcing DVMT/framebuffer processing when the DVMT module is not enabled.
+
+This reduces machine-specific assumptions in default boots and keeps aggressive behavior available only when explicitly requested for debugging.
 
 ## GPU Scheduler
 

@@ -63,6 +63,15 @@ static bool isWEGCoexistMode() {
 	return checkKernelArgument("-nbwegcoex");
 }
 
+static bool isExperimentalMonitorEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenexp", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenexp");
+}
+
 bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	
 	if (kextG11FB.loadIndex == index) {
@@ -504,7 +513,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		else {
 			LookupPatchPlus const patches[] = {// tgl debug kext
 				{activeKext, f1, r1, arrsize(f1),	1},
-				{activeKext, f2, r2, arrsize(f2),	1},
+				// f2 (osinfo pipe/port/fb counts) disabled: wrong counts can corrupt scanout layout
+				//{activeKext, f2, r2, arrsize(f2),	1},
 				/*{activeKext, f2b, r2b, arrsize(f2b),	1},
 				 {activeKext, f2c, r2c, arrsize(f2c),	1},*/
 				 {activeKext, f2d, r2d, arrsize(f2d),	1},
@@ -517,14 +527,20 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				//{activeKext, f6a, r6a, arrsize(f6a),	1},
 				{activeKext, f7, r7, arrsize(f7),	1},
 				{activeKext, f10, r10, arrsize(f10),	1},
-				// Bypass port probing on spoofed HW (hangs without this)
+				// f13: mandatory. Without this port-probe bypass the spoofed TGL path freezes during boot.
 				{activeKext, f13, r13, arrsize(f13),	1},
+				// f13b: mandatory. Without this bypass AppleIntelPort::probePortStateEv hits
+				// a pure-virtual call and panics in WindowServer during enableController.
 				{activeKext, f13b, r13b, arrsize(f13b),	1},
-				{activeKext, f15, r15, arrsize(f15),	1},
+				// f15: optional. Left disabled to preserve the minimum patch set until a boot with
+				// valid AAPL,ig-platform-id proves that this extra probe-path bypass is needed.
+				//{activeKext, f15, r15, arrsize(f15),	1},
 				//{activeKext, f16, r16, arrsize(f16),	1},
 				//{activeKext, f19, r19, arrsize(f19),	1},
 			//	{activeKext, f20, r20, arrsize(f20),	1},
-				{activeKext, f21, r21, arrsize(f21),	1},
+				// f21: optional. Left disabled to avoid unnecessary SafeForceWake-path changes
+				// until a valid-platform-id boot shows it is actually required.
+				//{activeKext, f21, r21, arrsize(f21),	1},
 				// Avoid forcing pixel/timing constants in hw CRTC path.
 				//{activeKext, f22, r22, arrsize(f22),    1},
 				
@@ -544,32 +560,46 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		auto *activeKext = &kextG11HW;
 		DBGLOG("ngreen", "init AppleIntelICLGraphics!");
 		NGreen::callback->setRMMIOIfNecessary();
-		
-		RouteRequestPlus requests[] = {
-			 // PAVP/DRM: intercept session command callback (ICL hardware path, shared hook with TGL)
-			 {"__ZN16IntelAccelerator19PAVPCommandCallbackE22PAVPSessionCommandID_tjPjb", wrapPavpSessionCallback, this->orgPavpSessionCallback},
-			 // getGPUInfo: override topology at ICL object offsets (different from TGL offsets)
-			 {"__ZN16IntelAccelerator10getGPUInfoEv", getGPUInfoICL, this->ogetGPUInfoICL},
-			 // initHardwareCaps NOT routed: NBlue's wrapper reads TGL offset 0x1120 for SKU,
-			 // but ICL stores SKU at 0x1150. Let the original ICL code run — SKU gates are patched.
-			 // IGScheduler5resume NOT routed: kIGHwCsDesc is only resolved for kextG11HWT.
-			 // With -disablegfxfirmware, Host Preemptive scheduler is selected (not IGScheduler5).
-		//last	 {"__ZN12IGScheduler56resumeEv", IGScheduler5resume, this->oIGScheduler5resume},
-			 // resetGraphicsEngine NOT routed: NBlue wrapper applies TGL GT workarounds which
-			 // target TGL MMIO offsets. Hardware is RPL-P (adlp/raptorlake) — using TGL workarounds
-			 // on RPL MMIO could corrupt the command streamer. Let the ICL original run unmodified.
-		//last	 {"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext", resetGraphicsEngine, this->oresetGraphicsEngine},
-			 // GuC: remap firmware binary load to match ICL GuC binary path
-			 {"__ZN13IGHardwareGuC13loadGuCBinaryEv", loadGuCBinary, this->oloadGuCBinary},
-		//last	 {"__ZN13IGHardwareGuC18checkWOPCMSettingsEmR14IOVirtualRange", checkWOPCMSettings, this->ocheckWOPCMSettings},
-		//last	 {"__ZN11IGScheduler15canLoadFirmwareEP16IntelAccelerator", canLoadFirmware, this->ocanLoadFirmware},
-			 // V36: Hook readAndClearInterrupts to initialize Gen11 multi-engine GT interrupts.
-			 // Same implementation as TGL path — Gen11 IRQ registers are identical for ICL/TGL.
-			 // V37: DISABLED — caused boot hang on TGL path; disabling ICL too for safety.
-			 // {"__ZN16IntelAccelerator23readAndClearInterruptsEPv", readAndClearInterrupts, this->oreadAndClearInterrupts},
-		 };
+		const bool wegCoexist = isWEGCoexistMode();
 
-		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route dp symbols");
+		{
+			// loadGuCBinary: always route — WEG's firmware path is Mojave-gated and dead on Sonoma.
+			// Without this hook, no GuC binary loads at all in coexist mode → ring dead.
+			RouteRequestPlus firmwareRoute[] = {
+				{"__ZN13IGHardwareGuC13loadGuCBinaryEv", loadGuCBinary, this->oloadGuCBinary},
+			};
+			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, firmwareRoute, address, size), "ngreen", "Failed to route loadGuCBinary (ICL)");
+		}
+
+		if (!wegCoexist) {
+			RouteRequestPlus requests[] = {
+				 // PAVP/DRM: intercept session command callback (ICL hardware path, shared hook with TGL)
+				 {"__ZN16IntelAccelerator19PAVPCommandCallbackE22PAVPSessionCommandID_tjPjb", wrapPavpSessionCallback, this->orgPavpSessionCallback},
+				 // initHardwareCaps NOT routed: NBlue's wrapper reads TGL offset 0x1120 for SKU,
+				 // but ICL stores SKU at 0x1150. Let the original ICL code run — SKU gates are patched.
+				 // IGScheduler5resume NOT routed: kIGHwCsDesc is only resolved for kextG11HWT.
+				 // With -disablegfxfirmware, Host Preemptive scheduler is selected (not IGScheduler5).
+			//last	 {"__ZN12IGScheduler56resumeEv", IGScheduler5resume, this->oIGScheduler5resume},
+				 // resetGraphicsEngine NOT routed: NBlue wrapper applies TGL GT workarounds which
+				 // target TGL MMIO offsets. Hardware is RPL-P (adlp/raptorlake) — using TGL workarounds
+				 // on RPL MMIO could corrupt the command streamer. Let the ICL original run unmodified.
+			//last	 {"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext", resetGraphicsEngine, this->oresetGraphicsEngine},
+			//last	 {"__ZN13IGHardwareGuC18checkWOPCMSettingsEmR14IOVirtualRange", checkWOPCMSettings, this->ocheckWOPCMSettings},
+			//last	 {"__ZN11IGScheduler15canLoadFirmwareEP16IntelAccelerator", canLoadFirmware, this->ocanLoadFirmware},
+				 // V36: Hook readAndClearInterrupts to initialize Gen11 multi-engine GT interrupts.
+				 // Same implementation as TGL path — Gen11 IRQ registers are identical for ICL/TGL.
+				 // V37: DISABLED — caused boot hang on TGL path; disabling ICL too for safety.
+				 // {"__ZN16IntelAccelerator23readAndClearInterruptsEPv", readAndClearInterrupts, this->oreadAndClearInterrupts},
+			};
+
+			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route dp symbols");
+
+			RouteRequestPlus gpuInfoRoute[] = {
+				// getGPUInfo: override topology at ICL object offsets (different from TGL offsets)
+				{"__ZN16IntelAccelerator10getGPUInfoEv", getGPUInfoICL, this->ogetGPUInfoICL},
+			};
+			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, gpuInfoRoute, address, size), "ngreen", "Failed to route getGPUInfoICL");
+		}
 		
 		// SKU gate 1+2: NOP JNZ/JA + XOR eax,eax (Sonoma AppleIntelICLGraphics, verified in KC)
 		static const uint8_t fSKUGates12[] = {
@@ -640,23 +670,16 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		SYSLOG_COND(!SolveRequestPlus::solveAll(patcher, index, solveRequests, address, size), "ngreen",	"Failed to resolve symbols");
 		 */
 		
-		 RouteRequestPlus requests[] = {
-			 
+		const bool wegCoexist = isWEGCoexistMode();
+
+		RouteRequestPlus requests[] = {
+			
 			 {"__ZN16IntelAccelerator20_PAVPCommandCallbackEP8OSObject22PAVPSessionCommandID_tjPj", wrapPavpSessionCallback, this->orgPavpSessionCallback},
-			 
-			 {"__ZN13IGHardwareGuC13loadGuCBinaryEv", loadGuCBinary, this->oloadGuCBinary},
-			 
-			 {"__ZN16IntelAccelerator10getGPUInfoEv", getGPUInfo, this->ogetGPUInfo},
 			
 			 // resetGraphicsEngine: apply RPL GT workarounds (Wa_14011060649, Wa_14011059788, Wa_14015795083)
 			 // before the original TGL engine reset. Without these, GPU hangs on first 3D command.
 			 {"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext", resetGraphicsEngine, this->oresetGraphicsEngine},
-			 
-			 // ForceWake: replace Apple's SafeForceWakeMultithreaded with i915-ported version.
-			 // Apple's code uses 90ms timeouts and no fallback; ours uses 50ms + reserve-bit fallback.
-			 // The original domain mapping was broken (d<<1 loop misaligned Apple's 3-bit dom bitmap).
-			 {"__ZN16IntelAccelerator26SafeForceWakeMultithreadedEbjj", forceWake, this->oforceWake},
-			 
+			
 			 // start: inject MultiForceWakeSelect=1 into Development dictionary BEFORE original start.
 			 // This tells the accelerator to use our hooked SafeForceWakeMultithreaded instead of
 			 // the framebuffer's SafeForceWake (which fails on RPL-P with ForceWake ACK=0).
@@ -681,7 +704,33 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			 
 		 };
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route symbols");
-		
+
+		{
+			// loadGuCBinary: always route — WEG's firmware path is Mojave-gated and dead on Sonoma.
+			// Without this hook, no GuC binary loads at all in coexist mode → ring dead.
+			RouteRequestPlus firmwareRoute[] = {
+				{"__ZN13IGHardwareGuC13loadGuCBinaryEv", loadGuCBinary, this->oloadGuCBinary},
+			};
+			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, firmwareRoute, address, size), "ngreen", "Failed to route loadGuCBinary");
+		}
+
+		if (!wegCoexist) {
+			RouteRequestPlus coexistOffRoutes[] = {
+				// ForceWake: replace Apple's SafeForceWakeMultithreaded with i915-ported version.
+				// Apple's code uses 90ms timeouts and no fallback; ours uses 50ms + reserve-bit fallback.
+				// The original domain mapping was broken (d<<1 loop misaligned Apple's 3-bit dom bitmap).
+				{"__ZN16IntelAccelerator26SafeForceWakeMultithreadedEbjj", forceWake, this->oforceWake},
+			};
+			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, coexistOffRoutes, address, size), "ngreen", "Failed to route coexist-off symbols");
+		}
+
+		if (!wegCoexist) {
+			RouteRequestPlus gpuInfoRoute[] = {
+				{"__ZN16IntelAccelerator10getGPUInfoEv", getGPUInfo, this->ogetGPUInfo},
+			};
+			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, gpuInfoRoute, address, size), "ngreen", "Failed to route getGPUInfo");
+		}
+
 		// SKU/device-ID panic bypass (verified @ 0x23c1d in LE binary)
 		// Original: mov edi,[rsi]; cmp edi,0xDEAFBEEE; jg sentinel; cmp edi,0x9A408086; je ok; cmp edi,0x9A488086; je ok; call panic
 		// Patch:    nop the sentinel-jg + change last "je ok" → "jmp ok" → always jumps to GT2 init path.
@@ -1479,7 +1528,13 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	v60Count++;
 	
 	auto *svc = static_cast<IOService *>(param0);
-	
+
+	// Guard: bail if MMIO mapping has been released (GPU torn down before timer fired).
+	if (!NGreen::callback->mmioValid()) {
+		SYSLOG("ngreen", "v60[%d]: MMIO not ready, skipping health check", v60Count);
+		return;
+	}
+
 	// 1. Read GPU state via direct MMIO
 	uint32_t realErr = NGreen::callback->readReg32(ERROR_GEN6);
 	uint32_t rcsHead = NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE));
@@ -1830,32 +1885,22 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 	
-	// ── V79: Force linear tiling on display plane (diagnostic logging) ──
-	// V80 does the actual enforcement in the 50ms EMR timer. V79 logs the state.
-	if (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30) {
+	// ── V79: Framebuffer status monitor (every cycle) ──
+	// Keep this read-only; no plane mutation here.
+	{
 		uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
 		uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
+		uint32_t planSurf = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
+		uint32_t planSize = NGreen::callback->readReg32(0x70190); // PLANE_SIZE
+		uint32_t planPos  = NGreen::callback->readReg32(0x7018C); // PLANE_POS
+		uint32_t pipeConf = NGreen::callback->readReg32(0x70008); // PIPE_CONF_A
 		uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
-		if (tiling != 0) {
-			// Currently tiled — convert stride and clear tiling
-			uint32_t newCtl = planCtl & ~(0x7u << 10); // clear tiling → linear
-			uint32_t newStrd = planStrd;
-			if (tiling == 1) { // X-tiled: stride is in 512B units, linear needs 64B units
-				newStrd = planStrd * 8;
-			} else if (tiling == 4) { // Tile4: stride in tile rows, ×4 for 128B→64B then ×4 rows
-				newStrd = planStrd * 16;
-			}
-			NGreen::callback->writeReg32(0x70180, newCtl);   // PLANE_CTL
-			NGreen::callback->writeReg32(0x70188, newStrd);  // PLANE_STRIDE
-			// Write PLANE_SURF with same value to arm/latch the changes
-			uint32_t planSurf = NGreen::callback->readReg32(0x7019C);
-			NGreen::callback->writeReg32(0x7019C, planSurf); // PLANE_SURF (re-arm)
-			SYSLOG("ngreen", "V79[%d]: tiling %d→linear CTL 0x%x→0x%x STRIDE 0x%x→0x%x SURF=0x%x",
-				   v60Count, tiling, planCtl, newCtl, planStrd, newStrd, planSurf);
-		} else {
-			SYSLOG("ngreen", "V79[%d]: already linear CTL=0x%x STRIDE=0x%x", v60Count, planCtl, planStrd);
-		}
+		SYSLOG("ngreen", "V79[%d]: PIPE=0x%x CTL=0x%x STRIDE=0x%x SURF=0x%x SIZE=0x%x POS=0x%x tiling=%d",
+			   v60Count, pipeConf, planCtl, planStrd, planSurf, planSize, planPos, tiling);
 	}
+
+	// V79B disabled: one-shot plane kick created transient flash artifacts that
+	// masked real bring-up behavior. Keep V79 read-only logging for diagnosis.
 
 	// ── V75: Display pipeline register dump — diagnose black screen ──
 	// System stays alive but display is black. Read pipe/plane/transcoder/backlight
@@ -1990,7 +2035,9 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	// V88: Fill 4 color bands (RED/GREEN/BLUE/WHITE) to test if display reads our
 	// data at all. Flush GGTT TLB. Toggle plane off/on. Probe transcoders.
 
-	if (v60Count >= 1 && v60Count <= 30) {
+	// V88 diagnostics disabled for stability: this block mutates scanout state and
+	// touches framebuffer mappings during bring-up, which can trigger MCEs.
+	if (false && v60Count >= 1 && v60Count <= 30) {
 		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C);
 		uint32_t surfPage = surfAddr >> 12;
 
@@ -2080,12 +2127,12 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 			desc->release();
 		}
 
-		// 4. Re-arm PLANE_SURF
-		if (filled > 0)
+		// 4. Re-arm PLANE_SURF (guard: zero → GGTT[0] → phys 0x3e800000 stolen mem → MCE)
+		if (filled > 0 && surfAddr != 0)
 			NGreen::callback->writeReg32(0x7019C, surfAddr);
 
 		// 5. On iteration 5: toggle plane OFF then ON (force re-init)
-		if (v60Count == 5 && filled > 0) {
+		if (v60Count == 5 && filled > 0 && surfAddr != 0) {
 			uint32_t planCtl = NGreen::callback->readReg32(0x70180);
 			// Disable plane (clear bit 31)
 			NGreen::callback->writeReg32(0x70180, planCtl & ~0x80000000u);
@@ -2862,45 +2909,42 @@ bool Gen11::start(void *that,void  *param_1)
 		SYSLOG("ngreen", "V45: post-registerService state=0x%llx (reg=%d match=%d)",
 			   (unsigned long long)svcState, !!(svcState & 0x02), !!(svcState & 0x04));
 		
-		// 8. Schedule delayed child checks at 3s, 10s, 15s, 20s, 30s, 60s, 120s
-		v45ScheduleDelayedCheck(that, 3000);
-		v45ScheduleDelayedCheck(that, 10000);
-		v45ScheduleDelayedCheck(that, 15000);   // V56: pinpoint teardown timing
-		v45ScheduleDelayedCheck(that, 20000);   // V56: pinpoint teardown timing
-		v45ScheduleDelayedCheck(that, 30000);
-		v45ScheduleDelayedCheck(that, 60000);
-		v45ScheduleDelayedCheck(that, 120000);
-		SYSLOG("ngreen", "V59: scheduled delayed child checks at T+3,10,15,20,30,60,120s");
-		
-		// V60/V74 are RPL/ADL stability workarounds. Keep native path on real TGL.
-		if (!NGreen::callback->isRealTGL) {
-			// V60: Start health monitor (2s interval, 120s) — active ERROR_GEN6 suppression.
-			// V57 timer-based R/W clear proven for IGAccelDevice stability (10 children).
-			{
-				auto monTimer = thread_call_allocate(v60GpuHealthMonitor,
-												 static_cast<thread_call_param_t>(static_cast<IOService *>(that)));
-				if (monTimer) {
-					uint64_t deadline;
-					clock_interval_to_deadline(2, kSecondScale, &deadline);
-					thread_call_enter_delayed(monTimer, deadline);
-					SYSLOG("ngreen", "V60: GPU health monitor armed — 2s interval, 60 iterations (120s)");
+		if (isExperimentalMonitorEnabled()) {
+			// 8. Experimental diagnostics: delayed child checks and timer-driven MMIO monitors.
+			v45ScheduleDelayedCheck(that, 3000);
+			v45ScheduleDelayedCheck(that, 10000);
+			v45ScheduleDelayedCheck(that, 15000);   // V56: teardown timing probe
+			v45ScheduleDelayedCheck(that, 20000);   // V56: teardown timing probe
+			v45ScheduleDelayedCheck(that, 30000);
+			v45ScheduleDelayedCheck(that, 60000);
+			v45ScheduleDelayedCheck(that, 120000);
+			SYSLOG("ngreen", "V59: experimental delayed child checks enabled");
+
+			// V60/V74 are invasive and can affect broader compatibility; keep opt-in only.
+			if (!NGreen::callback->isRealTGL) {
+				{
+					auto monTimer = thread_call_allocate(v60GpuHealthMonitor,
+											 static_cast<thread_call_param_t>(static_cast<IOService *>(that)));
+					if (monTimer) {
+						uint64_t deadline;
+						clock_interval_to_deadline(2, kSecondScale, &deadline);
+						thread_call_enter_delayed(monTimer, deadline);
+						SYSLOG("ngreen", "V60: experimental GPU health monitor armed");
+					}
 				}
-			}
-			// V74: Start PERMANENT EMR enforcer — 50ms interval, runs forever.
-			// V71 proved 30s window works; V72 proved Apple uses direct MMIO for EMR.
-			// Device dies the moment timer stops → never stop it.
-			{
-				auto emrTimer = thread_call_allocate(v71EmrEnforcer,
-												 static_cast<thread_call_param_t>(static_cast<IOService *>(that)));
-				if (emrTimer) {
-					uint64_t deadline;
-					clock_interval_to_deadline(50, kMillisecondScale, &deadline);
-					thread_call_enter_delayed(emrTimer, deadline);
-					SYSLOG("ngreen", "V74: EMR enforcer armed — 50ms interval, PERMANENT");
+				{
+					auto emrTimer = thread_call_allocate(v71EmrEnforcer,
+											 static_cast<thread_call_param_t>(static_cast<IOService *>(that)));
+					if (emrTimer) {
+						uint64_t deadline;
+						clock_interval_to_deadline(50, kMillisecondScale, &deadline);
+						thread_call_enter_delayed(emrTimer, deadline);
+						SYSLOG("ngreen", "V74: experimental EMR enforcer armed");
+					}
 				}
 			}
 		} else {
-			SYSLOG("ngreen", "V60/V74 skipped on real TGL");
+			SYSLOG("ngreen", "compat mode: experimental V45/V59/V60/V74 timers are disabled (use -ngreenexp to enable)");
 		}
 	}
 	
@@ -3642,6 +3686,76 @@ void Gen11::radWriteRegister32f(void *that,unsigned long param_1, UInt32 param_2
 
 void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 {
+	// V93: Prevent fatal display-engine fetches from stolen-memory base.
+	// Generalized for multiple Gen11 display pipes/planes instead of one hardcoded register pair.
+	// If an enabled plane gets SURF=0, hardware may fetch GGTT[0] (e.g. phys 0x3e800000) and trigger MCE.
+	struct V93PlaneSurfState {
+		uint32_t surfReg;
+		uint32_t lastNonZeroSurf;
+	};
+	static V93PlaneSurfState v93States[8] {};
+	static int v93LogCount = 0;
+
+	auto getV93State = [](uint32_t surfReg) -> V93PlaneSurfState * {
+		for (auto &state : v93States) {
+			if (state.surfReg == surfReg)
+				return &state;
+		}
+		for (auto &state : v93States) {
+			if (state.surfReg == 0) {
+				state.surfReg = surfReg;
+				state.lastNonZeroSurf = 0;
+				return &state;
+			}
+		}
+		return nullptr;
+	};
+
+	if (NGreen::callback) {
+		const uint32_t reg = static_cast<uint32_t>(param_1 & 0xFFFFF);
+		const bool looksLikePlaneSurf =
+			(reg >= 0x60000 && reg <= 0xBFFFF) &&
+			((reg & 0xFFF) == 0x19C);
+
+		if (looksLikePlaneSurf) {
+			auto *state = getV93State(reg);
+			if (param_2 != 0) {
+				if (state)
+					state->lastNonZeroSurf = param_2;
+			} else {
+				const uint32_t ctlReg = reg - 0x1C; // PLANE_CTL is SURF - 0x1C on Gen11 paths.
+				uint32_t planCtl = NGreen::callback->readReg32(ctlReg);
+				if (planCtl & 0x80000000u) {
+					if (state && state->lastNonZeroSurf != 0) {
+						if (v93LogCount < 32) {
+							SYSLOG("ngreen", "V93: blocked zero SURF@0x%x while enabled; keeping last 0x%x", reg, state->lastNonZeroSurf);
+							v93LogCount++;
+						}
+						param_2 = state->lastNonZeroSurf;
+					} else {
+						uint32_t currentSurf = NGreen::callback->readReg32(reg);
+						if (currentSurf != 0) {
+							if (state)
+								state->lastNonZeroSurf = currentSurf;
+							if (v93LogCount < 32) {
+								SYSLOG("ngreen", "V93: blocked zero SURF@0x%x while enabled; keeping current 0x%x", reg, currentSurf);
+								v93LogCount++;
+							}
+							param_2 = currentSurf;
+						} else {
+							// Last resort: disable plane before allowing SURF=0 write.
+							NGreen::callback->writeReg32(ctlReg, planCtl & ~0x80000000u);
+							if (v93LogCount < 32) {
+								SYSLOG("ngreen", "V93: forced plane disable for SURF@0x%x before zero write", reg);
+								v93LogCount++;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// ── V72: EMR write intercept — force all errors masked ──
 	if (param_1 == 0x20b4 || param_1 == 0x220b4) {
 		if (param_2 != 0xFFFFFFFF) {
@@ -3655,20 +3769,15 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 		}
 	}
 
-	// Force linear tiling for display plane registers.
-	// Without GPU acceleration, surfaces are linear but the driver computes
-	// Tile4 stride (÷512). Convert back to linear stride (÷64) = multiply by 8.
-	// PLANE_CTL bits[14:12] = tiling mode: force 000 (linear).
-	// V80: Use masked comparison to also catch raWriteRegister32b calls
-	// (where param_1 may be base_addr + offset instead of raw offset)
-	if ((param_1 & 0xFFFFF) == 0x70188) { // PLANE_STRIDE Pipe A Plane 1
-		UInt32 linear = param_2 * 8;
-		DBGLOG("ngreen", "PLANE_STRIDE fixup: 0x%x -> 0x%x (linear)", param_2, linear);
-		param_2 = linear;
+	// PLANE_STRIDE and PLANE_CTL fixups disabled: driver already programs correct
+	// linear stride without GPU accel. The * 8 multiplier produced 8× too wide
+	// stride → horizontal bars, TV noise, quadruplicate cursor. Let driver values pass.
+	// Keeping the log so we can observe what the driver actually writes.
+	if ((param_1 & 0xFFFFF) == 0x70188) { // PLANE_STRIDE Pipe A Plane 1 (log only)
+		DBGLOG("ngreen", "PLANE_STRIDE passthrough: 0x%lx val=0x%x", param_1, param_2);
 	}
-	if ((param_1 & 0xFFFFF) == 0x70180) { // PLANE_CTL Pipe A Plane 1
-		param_2 &= ~(0x7u << 10); // clear tiling bits[12:10] → linear
-		DBGLOG("ngreen", "PLANE_CTL fixup: forced linear tiling 0x%x", param_2);
+	if ((param_1 & 0xFFFFF) == 0x70180) { // PLANE_CTL Pipe A Plane 1 (log only)
+		DBGLOG("ngreen", "PLANE_CTL passthrough: 0x%lx val=0x%x tiling_bits=0x%x", param_1, param_2, (param_2 >> 10) & 0x7);
 	}
 
 	if (reinterpret_cast<volatile uint64_t*>(that)==nullptr) return NGreen::callback->writeReg32(param_1,param_2);
@@ -3690,7 +3799,28 @@ void Gen11::raWriteRegister32b(void *that,void *param_1,unsigned long param_2, U
 void Gen11::raWriteRegister64(void *that,unsigned long param_1,UInt64 param_2)
 {
 	//if (reinterpret_cast<volatile uint64_t*>(that)==nullptr) return;
-	FunctionCast(raWriteRegister64, callback->oraWriteRegister64)( that,param_1,param_2);
+
+	if (NGreen::callback) {
+		const uint32_t reg = static_cast<uint32_t>(param_1 & 0xFFFFF);
+		const bool looksLikePlaneSurf =
+			(reg >= 0x60000 && reg <= 0xBFFFF) &&
+			((reg & 0xFFF) == 0x19C);
+
+		if (looksLikePlaneSurf && param_2 == 0) {
+			const uint32_t ctlReg = reg - 0x1C;
+			const uint32_t planCtl = NGreen::callback->readReg32(ctlReg);
+			if (planCtl & 0x80000000U) {
+				const uint32_t currentSurf = NGreen::callback->readReg32(reg);
+				if (currentSurf != 0) {
+					param_2 = static_cast<UInt64>(currentSurf);
+				} else {
+					NGreen::callback->writeReg32(ctlReg, planCtl & ~0x80000000U);
+				}
+			}
+		}
+	}
+
+	FunctionCast(raWriteRegister64, callback->oraWriteRegister64)(that, param_1, param_2);
 };
 
 void Gen11::raWriteRegister64b(void *that,void *param_1,unsigned long param_2,UInt64 param_3)

@@ -37,6 +37,95 @@ static Gen11 gen11;
 static DYLDPatches dyldpatches;
 static HDMI agfxhda;
 
+static bool isLegacyIGPUPropSeedingEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenforceprops", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenforceprops");
+}
+
+static bool seedIGPUPropertiesOnEntry(IORegistryEntry *entry) {
+	if (!entry) {
+		return false;
+	}
+
+	bool changed = false;
+
+	// Default fallback platform-id for TGL framebuffers. Only inject when missing.
+	if (!entry->getProperty("AAPL,ig-platform-id")) {
+		static uint8_t platformId[] = {0x02, 0x00, 0x5C, 0x8A};
+		entry->setProperty("AAPL,ig-platform-id", platformId, arrsize(platformId));
+		changed = true;
+	}
+
+	if (!entry->getProperty("built-in")) {
+		static uint8_t builtin[] = {0x00};
+		entry->setProperty("built-in", builtin, arrsize(builtin));
+		changed = true;
+	}
+
+	if (!entry->getProperty("AAPL,slot-name")) {
+		entry->setProperty("AAPL,slot-name", const_cast<char *>("built-in"), 9);
+		changed = true;
+	}
+
+	if (!entry->getProperty("hda-gfx")) {
+		entry->setProperty("hda-gfx", const_cast<char *>("onboard-1"), 10);
+		changed = true;
+	}
+
+	if (!entry->getProperty("model")) {
+		entry->setProperty("model", const_cast<char *>("Intel Iris Xe Graphics"), 23);
+		changed = true;
+	}
+
+	if (!entry->getProperty("framebuffer-unifiedmem")) {
+		static uint8_t unifiedMem[] = {0x00, 0x00, 0x00, 0x60}; // 1536 MB
+		entry->setProperty("framebuffer-unifiedmem", unifiedMem, arrsize(unifiedMem));
+		changed = true;
+	}
+
+	if (!entry->getProperty("saved-config")) {
+		static uint8_t sconf[] = {};
+		entry->setProperty("saved-config", sconf, 0xea);
+		changed = true;
+	}
+
+	return changed;
+}
+
+static void seedIGPUPropertiesEarly() {
+	// Try common ACPI namespace variants used by laptop firmware before DeviceInfo scans.
+	const char *paths[] = {
+		"IOService:/AppleACPIPlatformExpert/PC00@0/IGPU@2",
+		"IOService:/AppleACPIPlatformExpert/PC00@0/GFX0@2",
+		"IOService:/AppleACPIPlatformExpert/PCI0@0/IGPU@2",
+		"IOService:/AppleACPIPlatformExpert/PCI0@0/GFX0@2"
+	};
+
+	bool found = false;
+	bool changed = false;
+	for (auto path : paths) {
+		auto *entry = IORegistryEntry::fromPath(path, gIOServicePlane);
+		if (!entry) {
+			continue;
+		}
+		found = true;
+		if (seedIGPUPropertiesOnEntry(entry)) {
+			changed = true;
+		}
+		entry->release();
+	}
+
+	if (found) {
+		SYSLOG("ngreen", "Early IGPU pre-seed via IOService path: changed=%d", changed);
+	} else {
+		SYSLOG("ngreen", "Early IGPU pre-seed skipped: no IGPU path resolved before DeviceInfo");
+	}
+}
+
 void NGreen::init() {
     callback = this;
 	
@@ -74,6 +163,13 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 		DBGLOG("ngreen", "DYLD patches disabled by boot argument -nbdyldoff");
 	}
 
+	// Compatibility-first default: do not force-inject IGPU properties unless explicitly requested.
+	if (isLegacyIGPUPropSeedingEnabled()) {
+		seedIGPUPropertiesEarly();
+	} else {
+		SYSLOG("ngreen", "compat mode: legacy IGPU property seeding disabled (use -ngreenforceprops to enable)");
+	}
+
     auto *devInfo = DeviceInfo::create();
     if (devInfo) {
         devInfo->processSwitchOff();
@@ -94,6 +190,9 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 
 		WIOKit::renameDevice(this->iGPU, "IGPU");
 		WIOKit::awaitPublishing(this->iGPU);
+		if (isLegacyIGPUPropSeedingEnabled()) {
+			seedIGPUPropertiesOnEntry(this->iGPU);
+		}
 		
 		static uint8_t sconf[] = {};
 		
@@ -112,14 +211,15 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 
 		//this->iGPU->setProperty("@0,display-dither-support", panel, arrsize(panel));
 		
-		this->iGPU->setProperty("built-in", builtin, arrsize(builtin));
-		this->iGPU->setProperty("AAPL,slot-name", const_cast<char *>("built-in"), 9);
-		this->iGPU->setProperty("hda-gfx", const_cast<char *>("onboard-1"), 10);
-		this->iGPU->setProperty("model", const_cast<char *>("Intel Iris Xe Graphics"), 23);
-		
-		
-		auto *prop = OSDynamicCast(OSData, this->iGPU->getProperty("saved-config"));
-		if (!prop) this->iGPU->setProperty("saved-config", sconf, 0xea);
+		if (isLegacyIGPUPropSeedingEnabled()) {
+			this->iGPU->setProperty("built-in", builtin, arrsize(builtin));
+			this->iGPU->setProperty("AAPL,slot-name", const_cast<char *>("built-in"), 9);
+			this->iGPU->setProperty("hda-gfx", const_cast<char *>("onboard-1"), 10);
+			this->iGPU->setProperty("model", const_cast<char *>("Intel Iris Xe Graphics"), 23);
+
+			auto *prop = OSDynamicCast(OSData, this->iGPU->getProperty("saved-config"));
+			if (!prop) this->iGPU->setProperty("saved-config", sconf, 0xea);
+		}
 			
 		//auto x = OSDynamicCast(OSData, this->iGPU->getProperty("AAPL,ig-platform-id"));
 		//framebufferId = *(uint32_t*)x->getBytesNoCopy();
@@ -163,9 +263,10 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 		stolen_size *= (1024 * 1024);
 		SYSLOG("ngreen", "stolen_size 0x%x",stolen_size);
 		
-		// Set framebuffer-unifiedmem = 1536 MB (0x60000000) for proper VRAM reporting
-		static uint8_t unifiedMem[] = {0x00, 0x00, 0x00, 0x60}; // 0x60000000 = 1536 MB
-		this->iGPU->setProperty("framebuffer-unifiedmem", unifiedMem, arrsize(unifiedMem));
+		if (isLegacyIGPUPropSeedingEnabled()) {
+			static uint8_t unifiedMem[] = {0x00, 0x00, 0x00, 0x60};
+			this->iGPU->setProperty("framebuffer-unifiedmem", unifiedMem, arrsize(unifiedMem));
+		}
 		
 		KernelPatcher::routeVirtual(this->iGPU, WIOKit::PCIConfigOffset::ConfigRead16, configRead16, &orgConfigRead16);
 		KernelPatcher::routeVirtual(this->iGPU, WIOKit::PCIConfigOffset::ConfigRead32, configRead32, &orgConfigRead32);

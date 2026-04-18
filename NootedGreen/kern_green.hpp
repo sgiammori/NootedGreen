@@ -71,8 +71,12 @@ class NGreen {
 	
     private:
 	
+	// Returns true when MMIO mapping is live and safe to access.
+	bool mmioValid() const { return rmmio != nullptr && rmmioPtr != nullptr; }
+
 	// reg = byte offset (i915 convention). rmmioPtr is uint32_t* so divide by 4.
 	UInt32 readReg32(unsigned long reg) {
+		if (!rmmio || !rmmioPtr) return 0;
 		if (reg + sizeof(uint32_t) <= this->rmmio->getLength()) {
 			return this->rmmioPtr[reg >> 2];
 		} else {
@@ -83,6 +87,37 @@ class NGreen {
 
 	// reg = byte offset (i915 convention). rmmioPtr is uint32_t* so divide by 4.
 	void writeReg32(unsigned long reg, UInt32 val) {
+		if (!rmmio || !rmmioPtr) return;
+		static int v93MmioLogCount = 0;
+
+		// Safety guard: prevent enabled display planes from being armed with SURF=0.
+		// On Gen11/TGL-class paths, SURF=0 may make HW fetch GGTT[0] (stolen base),
+		// which can trigger package-wide MCE on some systems.
+		const bool looksLikePlaneSurf =
+			(reg >= 0x60000 && reg <= 0xBFFFF) &&
+			((reg & 0xFFF) == 0x19C);
+		if (looksLikePlaneSurf && val == 0) {
+			const uint32_t ctlReg = static_cast<uint32_t>(reg - 0x1C);
+			const uint32_t planCtl = readReg32(ctlReg);
+			if (planCtl & 0x80000000U) {
+				const uint32_t currentSurf = readReg32(reg);
+				if (currentSurf != 0) {
+					if (v93MmioLogCount < 24) {
+						SYSLOG("ngreen", "V93M: blocked zero SURF@0x%lx in writeReg32; keeping current 0x%x", reg, currentSurf);
+						v93MmioLogCount++;
+					}
+					val = currentSurf;
+				} else {
+					// Last resort: disable plane before allowing zero surface address.
+					if (v93MmioLogCount < 24) {
+						SYSLOG("ngreen", "V93M: forcing plane disable before zero SURF@0x%lx in writeReg32", reg);
+						v93MmioLogCount++;
+					}
+					writeReg32(ctlReg, planCtl & ~0x80000000U);
+				}
+			}
+		}
+
 		if (reg + sizeof(uint32_t) <= this->rmmio->getLength()) {
 			this->rmmioPtr[reg >> 2] = val;
 		} else {
@@ -92,6 +127,7 @@ class NGreen {
 	}
 	
 	UInt64 readReg64(unsigned long reg) {
+		if (!rmmio || !rmmioPtr) return 0;
 		if (reg * sizeof(uint64_t) < this->rmmio->getLength()) {
 			return this->rmmioPtr[reg];
 		} else {
@@ -101,6 +137,31 @@ class NGreen {
 	}
 
 	void writeReg64(unsigned long reg, UInt64 val) {
+		if (!rmmio || !rmmioPtr) return;
+		static int v93Mmio64LogCount = 0;
+		const bool looksLikePlaneSurf =
+			(reg >= 0x60000 && reg <= 0xBFFFF) &&
+			((reg & 0xFFF) == 0x19C);
+		if (looksLikePlaneSurf && val == 0) {
+			const uint32_t ctlReg = static_cast<uint32_t>(reg - 0x1C);
+			const uint32_t planCtl = readReg32(ctlReg);
+			if (planCtl & 0x80000000U) {
+				const uint32_t currentSurf = readReg32(reg);
+				if (currentSurf != 0) {
+					if (v93Mmio64LogCount < 24) {
+						SYSLOG("ngreen", "V93M64: blocked zero SURF@0x%lx in writeReg64; keeping current 0x%x", reg, currentSurf);
+						v93Mmio64LogCount++;
+					}
+					val = currentSurf;
+				} else {
+					if (v93Mmio64LogCount < 24) {
+						SYSLOG("ngreen", "V93M64: forcing plane disable before zero SURF@0x%lx in writeReg64", reg);
+						v93Mmio64LogCount++;
+					}
+					writeReg32(ctlReg, planCtl & ~0x80000000U);
+				}
+			}
+		}
 		if ((reg * sizeof(uint64_t)) < this->rmmio->getLength()) {
 			this->rmmioPtr[reg] = val;
 		} else {
