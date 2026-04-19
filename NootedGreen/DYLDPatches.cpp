@@ -180,6 +180,15 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	//         mov rax,[rip+0x3f8faac1]; mov rax,[rax]; mov [rbp-0x30],rax
 	static const uint8_t f_skipac_sonoma[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0xd8, 0x01, 0x00, 0x00, 0x48, 0x8b, 0x05, 0xc1, 0xaa, 0x8f, 0x3f, 0x48, 0x8b, 0x00, 0x48, 0x89, 0x45, 0xd0};
 	static const uint8_t r_skipac_sonoma[] = {0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+
+	//CoreDisplay::DisplayPipe::RunFullDisplayPipe - null-guard virtual call (Sonoma 14.7.1)
+	//Stage-3 crash shows rdi == 0 at sequence:
+	//  mov rdi, [r14+0x888]
+	//  mov rax, [rdi]
+	//  call qword ptr [rax+0x28]
+	//Replace with test/jump so the call is skipped when rdi is NULL.
+	static const uint8_t f_runfdp_guard_sonoma[] = {0x49, 0x8b, 0xbe, 0x88, 0x08, 0x00, 0x00, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x28};
+	static const uint8_t r_runfdp_guard_sonoma[] = {0x48, 0x85, 0xff, 0x74, 0x06, 0x90, 0x90, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x28};
 	
 	
 	//skyl
@@ -196,6 +205,7 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
         static bool noMetal = false;
         static bool fullMTLChecked = false;
         static int fullMTLStage = 0;
+		static bool skylBypass = false;
         if (!noMetalChecked) {
 			// Safe default
 			noMetal = true;
@@ -228,6 +238,10 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			}
 			if (checkKernelArgument("-ngreenFullMTLTest") && fullMTLStage == 0)
 				fullMTLStage = 1;
+
+			// Optional SkyLight branch bypass for stage-3 black-screen diagnostics.
+			// Enable with: -ngreenSkylBypass
+			skylBypass = checkKernelArgument("-ngreenSkylBypass");
 			fullMTLChecked = true;
             noMetalChecked = true;
             SYSLOG("DYLD", "V50: Metal=%s (-ngreenNoMetal=%d)", noMetal ? "OFF" : "ON", noMetal);
@@ -236,6 +250,7 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 				fullMTLStage == 1 ? "AccessComplete enabled" :
 				fullMTLStage == 2 ? "AccessComplete+GetMTLTexture enabled" :
 				"RunFullDisplayPipe+GetMTLTexture+AccessComplete enabled");
+			SYSLOG("DYLD", "V102: SkyLight bypass=%s", skylBypass ? "ON" : "OFF");
         }
         
 		if (!noMetal) {
@@ -257,6 +272,12 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			};
 			const DYLDPatch stage3Patches[] = {
 				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
+				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma, Metal ON)"},
+			};
+			const DYLDPatch stage3SkylPatches[] = {
+				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
+				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma, Metal ON)"},
+				{f4, r4, "SkyLight conditional bypass (Sonoma, Metal ON)"},
 			};
 
 			const DYLDPatch *patches = stage0Patches;
@@ -268,8 +289,13 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 				patches = stage2Patches;
 				patchCount = arrsize(stage2Patches);
 			} else if (fullMTLStage >= 3) {
-				patches = stage3Patches;
-				patchCount = arrsize(stage3Patches);
+				if (skylBypass) {
+					patches = stage3SkylPatches;
+					patchCount = arrsize(stage3SkylPatches);
+				} else {
+					patches = stage3Patches;
+					patchCount = arrsize(stage3Patches);
+				}
 			}
 
 			DYLDPatch::applyAll(patches, patchCount, const_cast<void *>(data), PAGE_SIZE);
