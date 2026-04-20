@@ -8,7 +8,6 @@
 #include <IOKit/IODeviceTreeSupport.h>
 
 DYLDPatches *DYLDPatches::callback = nullptr;
-
 void DYLDPatches::init() { callback = this; }
 
 void DYLDPatches::processPatcher(KernelPatcher &patcher) {
@@ -136,252 +135,36 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 		SYSLOG("DYLD", "V50: Applied ICL Metal device-ID bypass (f2, mask-based)");
 	}
 	
-	//disp
-	static const uint8_t f3[] = {0x0F, 0x85, 0xE1, 0x03, 0x00, 0x00, 0x48, 0x8D, 0x3C, 0xDD, 0x00, 0x00, 0x00, 0x00, 0xE8, 0xA4, 0x1F, 0x0B, 0x00, 0x48, 0x8B, 0x3D, 0xE1, 0x5D, 0xCB, 0x41, 0x48, 0x89, 0x05, 0xDA, 0x5D, 0xCB, 0x41, 0x48, 0x85, 0xFF, 0x74, 0x05};
-	static const uint8_t r3[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x48, 0x8D, 0x3C, 0xDD, 0x00, 0x00, 0x00, 0x00, 0xE8, 0xA4, 0x1F, 0x0B, 0x00, 0x48, 0x8B, 0x3D, 0xE1, 0x5D, 0xCB, 0x41, 0x48, 0x89, 0x05, 0xDA, 0x5D, 0xCB, 0x41, 0x48, 0x85, 0xFF, 0x74, 0x05};
-	
-	static const uint8_t f3b[] = {0x75, 0x0A, 0xE8, 0x5C, 0x1B, 0x0B, 0x00, 0xE9, 0xD0, 0xF6, 0xFF, 0xFF, 0x83, 0xBD, 0xC0, 0xFE, 0xFF, 0xFF, 0x00, 0x48, 0x8D, 0x05, 0x20, 0x93, 0x0C, 0x00};
-	static const uint8_t r3b[] = {0x90, 0x90, 0xE8, 0x5C, 0x1B, 0x0B, 0x00, 0xE9, 0xD0, 0xF6, 0xFF, 0xFF, 0x83, 0xBD, 0xC0, 0xFE, 0xFF, 0xFF, 0x00, 0x48, 0x8D, 0x05, 0x20, 0x93, 0x0C, 0x00};
-	
-	//CoreDisplay assertion bypass - Sonoma 14.7.1
-	//CoreDisplay_CreateDisplayForCGXDisplayDevice: NOP jne to __assert_rtn
+	// Stage-3 Metal (hardcoded): assertion bypass + RunFullDisplayPipe NULL-guard
+	// + GetMTLTexture/CQ stubs. AccessComplete is live (not skipped).
+
+	//CoreDisplay_CreateDisplayForCGXDisplayDevice: NOP jne to __assert_rtn (Sonoma 14.7.1)
 	static const uint8_t f3b_sonoma[] = {0x75, 0x0A, 0xE8, 0x79, 0x03, 0x0B, 0x00, 0xE9, 0xE6, 0xF6, 0xFF, 0xFF, 0x83, 0xBD, 0xC0, 0xFE, 0xFF, 0xFF, 0x00, 0x48, 0x8D, 0x05, 0xF2, 0x76, 0x0C, 0x00};
 	static const uint8_t r3b_sonoma[] = {0x90, 0x90, 0xE8, 0x79, 0x03, 0x0B, 0x00, 0xE9, 0xE6, 0xF6, 0xFF, 0xFF, 0x83, 0xBD, 0xC0, 0xFE, 0xFF, 0xFF, 0x00, 0x48, 0x8D, 0x05, 0xF2, 0x76, 0x0C, 0x00};
-	
-	//CoreDisplay::DisplayPipe::RunFullDisplayPipe - return immediately (Sonoma 14.7.1)
-	//Without Metal acceleration, RunFullDisplayPipe crashes at multiple points
-	//(NULL MetalDevice, ud2 assertions, heap corruption from uninitialized Metal objects).
-	//Replace function prologue with ret to skip the entire Metal rendering path.
-	//Pattern: push rbp; mov rbp,rsp; push r15-r12; push rbx; sub rsp,0x578; mov [rbp-0x478],rsi; mov r14,rdi
-	static const uint8_t f_skipfdp_sonoma[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x78, 0x05, 0x00, 0x00, 0x48, 0x89, 0xb5, 0x88, 0xfb, 0xff, 0xff};
-	static const uint8_t r_skipfdp_sonoma[] = {0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
-	
-	//CoreDisplay::Display::Present - return immediately (Sonoma 14.7.1)
-	//Present calls AccessComplete which calls GetMTLTexture, asserting on NULL Metal device.
-	//This is a separate code path from RunFullDisplayPipe (display scanout vs compositing).
-	//Pattern: push rbp; mov rbp,rsp; push r15-r12; push rbx; sub rsp,0xa8; mov r14,rcx; mov ebx,edx; mov r12,rsi; mov r15,rdi
-	static const uint8_t f_skippresent_sonoma[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0xa8, 0x00, 0x00, 0x00, 0x49, 0x89, 0xce, 0x89, 0xd3, 0x49, 0x89, 0xf4, 0x49, 0x89, 0xff};
-	static const uint8_t r_skippresent_sonoma[] = {0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
-	
+
 	//CoreDisplay::DisplaySurface::GetMTLTexture - return NULL (Sonoma 14.7.1)
-	//Root cause: without Metal GPU, GetMTLTexture asserts on NULL MetalDevice.
-	//Called from AccessComplete (via Display::Present, DisplaySurface_Free, CDSurface::finish, etc.).
-	//Patching individual callers is whack-a-mole; patch GetMTLTexture itself to return NULL gracefully.
-	//xor eax,eax (31 c0); ret (c3) + NOPs
-	//Pattern: push rbp; mov rbp,rsp; push r15-r12; push rbx; sub rsp,0x168; mov r14,rsi; mov r15,rdi
 	static const uint8_t f_getmtltex_sonoma[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x68, 0x01, 0x00, 0x00, 0x49, 0x89, 0xf6, 0x49, 0x89, 0xff};
 	static const uint8_t r_getmtltex_sonoma[] = {0x31, 0xC0, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
 	
 	//CoreDisplay::MetalDevice::GetMTLCommandQueue() const - return NULL (Sonoma 14.7.1)
 	//Called from AccessComplete with rdi=NULL (NULL MetalDevice), crashes at mov rax,[rdi+8] (+30).
-	//Pattern (26 bytes): push rbp; mov rbp,rsp; push r15; push r14; push rbx; sub rsp,0x88;
-	//  mov rax,[rip+0x3f8829e9]; mov rax,[rax]  (first two insns after frame setup, no ambiguity)
 	static const uint8_t f_getmtlcq_sonoma[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0x88, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x05, 0xe9, 0x29, 0x88, 0x3f, 0x48, 0x8b, 0x00};
 	static const uint8_t r_getmtlcq_sonoma[] = {0x31, 0xc0, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
 
-	//CoreDisplay::DisplaySurface::AccessComplete - return immediately (Sonoma 14.7.1)
-	//AccessComplete calls multiple Metal functions (GetMTLTexture, GetMTLCommandQueue, etc.)
-	//on a NULL MetalDevice. Patching individual Metal functions is whack-a-mole.
-	//Patch AccessComplete prologue to return early and skip all Metal GPU synchronization.
-	//Pattern: push rbp; mov rbp,rsp; push r15-r12; push rbx; sub rsp,0x1d8;
-	//         mov rax,[rip+0x3f8faac1]; mov rax,[rax]; mov [rbp-0x30],rax
-	static const uint8_t f_skipac_sonoma[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0xd8, 0x01, 0x00, 0x00, 0x48, 0x8b, 0x05, 0xc1, 0xaa, 0x8f, 0x3f, 0x48, 0x8b, 0x00, 0x48, 0x89, 0x45, 0xd0};
-	static const uint8_t r_skipac_sonoma[] = {0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
-
-	//CoreDisplay::DisplayPipe::RunFullDisplayPipe - null-guard virtual call (Sonoma 14.7.1)
-	//Stage-3 crash shows rdi == 0 at sequence:
-	//  mov rdi, [r14+0x888]
-	//  mov rax, [rdi]
-	//  call qword ptr [rax+0x28]
-	//Replace with test/jump so the call is skipped when rdi is NULL.
-	// Original 13 bytes: mov rdi,[r14+0x888]; mov rax,[rdi]; call [rax+0x28]
-	// Replacement: keep the load, add test rdi,rdi; jz +6 (skips the 6-byte call sequence); nop
-	// With stale rdi=1 before my previous broken patch, the load was absent — fix by restoring it.
+	//CoreDisplay::DisplayPipe::RunFullDisplayPipe - NULL vcall guard (Sonoma 14.7.1)
+	//test rdi,rdi; jz +6 instead of mov rax,[rdi]; call [rax+0x28] — skips crash when rdi==NULL.
 	static const uint8_t f_runfdp_guard_sonoma[] = {0x49, 0x8b, 0xbe, 0x88, 0x08, 0x00, 0x00, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x28};
 	static const uint8_t r_runfdp_guard_sonoma[] = {0x49, 0x8b, 0xbe, 0x88, 0x08, 0x00, 0x00, 0x48, 0x85, 0xff, 0x74, 0x06, 0x90};
-	
-	
-	//skyl
-	static const uint8_t f4[] = {0x0F, 0x84, 0x9E, 0x00, 0x00, 0x00, 0xE8, 0x75, 0x3D, 0xEC, 0xFF, 0x4C, 0x8B, 0x3D, 0x58, 0xCC, 0x91, 0x3E, 0x4C, 0x89, 0xFF, 0xBE, 0x10, 0x00, 0x00, 0x00, 0xE8, 0x09, 0xEA, 0x1C, 0x00, 0x84, 0xC0, 0x0F, 0x84, 0x51, 0xFA, 0xFF, 0xFF};
-	static const uint8_t r4[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xE8, 0x75, 0x3D, 0xEC, 0xFF, 0x4C, 0x8B, 0x3D, 0x58, 0xCC, 0x91, 0x3E, 0x4C, 0x89, 0xFF, 0xBE, 0x10, 0x00, 0x00, 0x00, 0xE8, 0x09, 0xEA, 0x1C, 0x00, 0x84, 0xC0, 0x0F, 0x84, 0x51, 0xFA, 0xFF, 0xFF};
-	
-	
+
 	if (getKernelVersion() >= KernelVersion::Ventura) {
-		// V97: Metal is OFF by default on the RPL+TGL spoof path.
-		// WindowServer crash reports show NULL deref in
-		// CoreDisplay::DisplayPipe::RunFullDisplayPipe when Metal display-pipe is active.
-		// Keep CoreDisplay safety stubs enabled by default; opt into Metal explicitly.
-        static bool noMetalChecked = false;
-        static bool noMetal = false;
-        static bool fullMTLChecked = false;
-        static int fullMTLStage = 0;
-		static bool skylBypass = false;
-		static bool unsafeGetMTLTexture = false;
-        if (!noMetalChecked) {
-			// Safe default
-			noMetal = true;
-
-			// Optional explicit scalar boot-arg support: ngreenNoMetal=0|1
-			int noMetalArg = 0;
-			if (PE_parse_boot_argn("ngreenNoMetal", &noMetalArg, sizeof(noMetalArg))) {
-				noMetal = (noMetalArg != 0);
-			}
-
-			// Legacy flag still supported
-			if (checkKernelArgument("-ngreenNoMetal"))
-				noMetal = true;
-
-			// Explicit opt-in to Metal for experiments
-            bool legacyAllow = checkKernelArgument("-ngreenAllowMetal");
-            if (legacyAllow) noMetal = false;
-
-			// Experimental staged bring-up of full Metal path.
-			// Stages are only used when Metal is ON:
-			//   0 = keep all safety stubs
-			//   1 = re-enable AccessComplete only
-			//   2 = re-enable AccessComplete; keep GetMTLTexture stubbed by default
-			//   3 = re-enable RunFullDisplayPipe + AccessComplete; keep GetMTLTexture stubbed by default
-			// Unsafe opt-in: -ngreenUnsafeGetMTLTexture restores real GetMTLTexture in stage 2/3.
-			int fullMTLArg = 0;
-			if (PE_parse_boot_argn("ngreenFullMTLStage", &fullMTLArg, sizeof(fullMTLArg))) {
-				if (fullMTLArg < 0) fullMTLArg = 0;
-				if (fullMTLArg > 3) fullMTLArg = 3;
-				fullMTLStage = fullMTLArg;
-			}
-			if (checkKernelArgument("-ngreenFullMTLTest") && fullMTLStage == 0)
-				fullMTLStage = 1;
-
-			// Preserve real TGL behavior. On spoofed RPL/ADL paths, stage-3 is known to
-			// trigger WindowServer watchdog loops unless explicitly requested for diagnostics.
-			const bool allowUnsafeStage3 = checkKernelArgument("-ngreenUnsafeStage3");
-			if (!NGreen::callback->isRealTGL && fullMTLStage > 2 && !allowUnsafeStage3) {
-				SYSLOG("DYLD", "V104: clamping FullMTL stage %d -> 2 on non-real TGL (use -ngreenUnsafeStage3 to override)", fullMTLStage);
-				fullMTLStage = 2;
-			}
-
-			// Keep GetMTLTexture stubbed unless explicitly asked for crash-oriented diagnostics.
-			unsafeGetMTLTexture = checkKernelArgument("-ngreenUnsafeGetMTLTexture");
-			if (!NGreen::callback->isRealTGL && unsafeGetMTLTexture &&
-			    !checkKernelArgument("-ngreenReallyUnsafeGetMTLTexture")) {
-				SYSLOG("DYLD", "V107: ignoring -ngreenUnsafeGetMTLTexture on non-real TGL; use -ngreenReallyUnsafeGetMTLTexture to force it");
-				unsafeGetMTLTexture = false;
-			}
-
-			// Optional SkyLight branch bypass for stage-3 black-screen diagnostics.
-			// Enable with: -ngreenSkylBypass
-			skylBypass = checkKernelArgument("-ngreenSkylBypass");
-			fullMTLChecked = true;
-            noMetalChecked = true;
-            SYSLOG("DYLD", "V50: Metal=%s (-ngreenNoMetal=%d)", noMetal ? "OFF" : "ON", noMetal);
-			SYSLOG("DYLD", "V101: FullMTL stage=%d (%s)", fullMTLStage,
-				fullMTLStage == 0 ? "all safety stubs active" :
-				fullMTLStage == 1 ? "AccessComplete enabled" :
-				fullMTLStage == 2 ? "AccessComplete enabled (GetMTLTexture stubbed by default)" :
-				"RunFullDisplayPipe+AccessComplete enabled (GetMTLTexture stubbed by default)");
-			SYSLOG("DYLD", "V102: SkyLight bypass=%s", skylBypass ? "ON" : "OFF");
-			SYSLOG("DYLD", "V103: Unsafe GetMTLTexture=%s", unsafeGetMTLTexture ? "ON" : "OFF");
-			SYSLOG("DYLD", "V104: Unsafe stage3 override=%s", allowUnsafeStage3 ? "ON" : "OFF");
-        }
-        
-		if (!noMetal) {
-			// V101: staged Boot C hardening for full-MTL bring-up.
-			const DYLDPatch stage0Patches[] = {
-				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-				{f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma, Metal ON)"},
-				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma, Metal ON)"},
-				{f_skipac_sonoma, r_skipac_sonoma, "AccessComplete skip (Sonoma, Metal ON)"},
-			};
-			const DYLDPatch stage1Patches[] = {
-				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-				{f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma, Metal ON)"},
-				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma, Metal ON)"},
-				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON)"},
-			};
-			const DYLDPatch stage2Patches[] = {
-				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-				{f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma, Metal ON)"},
-				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON)"},
-			};
-			const DYLDPatch stage2SafePatches[] = {
-				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-				{f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma, Metal ON)"},
-				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma, Metal ON, safe stage2)"},
-				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON, safe stage2)"},
-				// V108: AccessComplete must also be skipped when GetMTLTexture is stubbed (stage2 safe).
-				// AccessComplete dereferences the returned NULL texture/queue pointer, causing WS SIGSEGV.
-				{f_skipac_sonoma, r_skipac_sonoma, "AccessComplete skip (Sonoma, Metal ON, safe stage2)"},
-			};
-			const DYLDPatch stage3Patches[] = {
-				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma, Metal ON)"},
-				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON)"},
-			};
-			const DYLDPatch stage3SafePatches[] = {
-				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma, Metal ON)"},
-				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma, Metal ON, safe stage3)"},
-				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON, safe stage3)"},
-			};
-			const DYLDPatch stage3SkylPatches[] = {
-				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma, Metal ON)"},
-				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON)"},
-				{f4, r4, "SkyLight conditional bypass (Sonoma, Metal ON)"},
-			};
-			const DYLDPatch stage3SafeSkylPatches[] = {
-				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma, Metal ON)"},
-				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma, Metal ON, safe stage3)"},
-				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON, safe stage3)"},
-				{f4, r4, "SkyLight conditional bypass (Sonoma, Metal ON)"},
-			};
-
-			const DYLDPatch *patches = stage0Patches;
-			size_t patchCount = arrsize(stage0Patches);
-			if (fullMTLStage == 1) {
-				patches = stage1Patches;
-				patchCount = arrsize(stage1Patches);
-			} else if (fullMTLStage == 2) {
-				if (unsafeGetMTLTexture) {
-					patches = stage2Patches;
-					patchCount = arrsize(stage2Patches);
-				} else {
-					patches = stage2SafePatches;
-					patchCount = arrsize(stage2SafePatches);
-				}
-			} else if (fullMTLStage >= 3) {
-				if (skylBypass) {
-					if (unsafeGetMTLTexture) {
-						patches = stage3SkylPatches;
-						patchCount = arrsize(stage3SkylPatches);
-					} else {
-						patches = stage3SafeSkylPatches;
-						patchCount = arrsize(stage3SafeSkylPatches);
-					}
-				} else {
-					if (unsafeGetMTLTexture) {
-						patches = stage3Patches;
-						patchCount = arrsize(stage3Patches);
-					} else {
-						patches = stage3SafePatches;
-						patchCount = arrsize(stage3SafePatches);
-					}
-				}
-			}
-
-			DYLDPatch::applyAll(patches, patchCount, const_cast<void *>(data), PAGE_SIZE);
-        } else {
-            // Metal OFF: stub out CoreDisplay Metal paths to prevent NULL MTLDevice crashes
-            const DYLDPatch patches[] = {
-                {f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-                {f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma)"},
-                // V98: removed Display::Present stub — allow hardware scanout path
-                {f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
-                {f_skipac_sonoma, r_skipac_sonoma, "AccessComplete skip (Sonoma)"},
-            };
-            DYLDPatch::applyAll(patches, const_cast<void *>(data), PAGE_SIZE);
-        }
-    }
-
-	
+		// Hardcoded stage-3 Metal: assertion bypass + RunFullDisplayPipe NULL-guard
+		// + GetMTLTexture/CQ stubs. AccessComplete is live (not skipped).
+		const DYLDPatch metalPatches[] = {
+			{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
+			{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma)"},
+			{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
+			{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma)"},
+		};
+		DYLDPatch::applyAll(metalPatches, const_cast<void *>(data), PAGE_SIZE);
+	}
 }

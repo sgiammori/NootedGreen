@@ -73,27 +73,34 @@ static bool isExperimentalMonitorEnabled() {
 }
 
 static bool isDisplayPipeForceDisabled() {
-	// Safe default for RPL+TGL spoof path:
-	// WindowServer repeatedly crashes in CoreDisplay::DisplayPipe::RunFullDisplayPipe
-	// with native display-pipe enabled. Keep it disabled unless explicitly requested.
+	// Stage-3 baseline now has DYLD-side NULL guards for DisplayPipe path.
+	// Keep native DisplayPipe ON by default and use ngreendp0 only as an explicit
+	// fallback switch when troubleshooting.
 	int nativeDisplayPipe = 0;
 	if (PE_parse_boot_argn("ngreendp1", &nativeDisplayPipe, sizeof(nativeDisplayPipe))) {
+		SYSLOG("ngreen", "V78A: parsed ngreendp1=%d", nativeDisplayPipe);
 		if (nativeDisplayPipe != 0)
 			return false;
 	}
 
-	if (checkKernelArgument("-ngreendp1"))
+	if (checkKernelArgument("-ngreendp1")) {
+		SYSLOG("ngreen", "V78A: detected -ngreendp1");
 		return false;
+	}
 
 	int enabled = 0;
 	if (PE_parse_boot_argn("ngreendp0", &enabled, sizeof(enabled))) {
+		SYSLOG("ngreen", "V78A: parsed ngreendp0=%d", enabled);
 		return enabled != 0;
 	}
 
-	if (checkKernelArgument("-ngreendp0"))
+	if (checkKernelArgument("-ngreendp0")) {
+		SYSLOG("ngreen", "V78A: detected -ngreendp0");
 		return true;
+	}
 
-	return true;
+	SYSLOG("ngreen", "V78A: default native DisplayPipeSupported (dp1 default ON)");
+	return false;
 }
 
 static bool isV93PlaneGuardEnabled() {
@@ -121,6 +128,20 @@ static bool isV88ScanoutFillEnabled() {
 	}
 
 	return checkKernelArgument("-ngreenv88");
+}
+
+static int getV77KillDelayIterations() {
+	int delay = 0;
+	if (PE_parse_boot_argn("ngreenV77DelayKill", &delay, sizeof(delay))) {
+		if (delay < 0)
+			return 0;
+		if (delay > 60)
+			return 60;
+		return delay;
+	}
+
+	// Final/default behavior: do not kill DisplayPipe clients unless explicitly requested.
+	return 60;
 }
 
 bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -1698,6 +1719,11 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	// WindowServer crash-loops in RunFullDisplayPipe when GPU can't render.
 	// Must kill these clients whenever they appear, throughout all 60 iterations.
 	{
+		const int v77KillDelay = getV77KillDelayIterations();
+		if (v77KillDelay > 0 && v60Count <= v77KillDelay) {
+			SYSLOG("ngreen", "V77: kill delayed at iter %d (ngreenV77DelayKill=%d)",
+			       v60Count, v77KillDelay);
+		} else {
 		OSIterator *dpIter = svc->getClientIterator();
 		if (dpIter) {
 			OSObject *dpObj;
@@ -1718,6 +1744,7 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 			if (dpKilled > 0) {
 				SYSLOG("ngreen", "V77: Killed %d display pipe client(s) at iter %d", dpKilled, v60Count);
 			}
+		}
 		}
 	}
 	
@@ -2972,12 +2999,11 @@ bool Gen11::start(void *that,void  *param_1)
 			}
 		}
 		
-		// V78: Disable GPU display pipe compositing when forced by boot-arg OR when
-		// experimental monitor (-ngreenexp) is active. In experimental mode, WS will
-		// attempt to open IOAccelDisplayPipeUserClient2 clients which V77 then kills,
-		// causing one unavoidable WindowServer recycle. Setting DisplayPipeSupported=0
-		// here prevents WS from spawning those clients in the first place — no recycle.
-		if (isDisplayPipeForceDisabled() || isExperimentalMonitorEnabled()) {
+		// V78: Keep native DisplayPipe ON by default. Experimental monitor logging must
+		// not disable DisplayPipe, otherwise we hide the exact first-light/compositor
+		// path we are trying to debug. Only an explicit ngreendp0 fallback should force
+		// DisplayPipeSupported=0.
+		if (isDisplayPipeForceDisabled()) {
 			auto *dpCaps = OSDictionary::withCapacity(2);
 			if (dpCaps) {
 				auto *dpSupp = OSNumber::withNumber(0ULL, 32);
@@ -2986,14 +3012,10 @@ bool Gen11::start(void *that,void  *param_1)
 				if (trSupp) { dpCaps->setObject("TransactionsSupported", trSupp); trSupp->release(); }
 				accelSvc->setProperty("IOAccelDisplayPipeCapabilities", dpCaps);
 				dpCaps->release();
-				if (isDisplayPipeForceDisabled()) {
-					SYSLOG("ngreen", "V78: DisplayPipeSupported=0 forced by boot-arg");
-				} else {
-					SYSLOG("ngreen", "V78: DisplayPipeSupported=0 set (experimental mode — prevents WS recycle)");
-				}
+				SYSLOG("ngreen", "V78: DisplayPipeSupported=0 forced by boot-arg");
 			}
 		} else {
-			SYSLOG("ngreen", "V78: keeping native DisplayPipeSupported (explicit -ngreendp1)");
+			SYSLOG("ngreen", "V78: keeping native DisplayPipeSupported");
 		}
 		
 		// 6. Explicit registerService() — ensures the service is visible to IOKit matching
