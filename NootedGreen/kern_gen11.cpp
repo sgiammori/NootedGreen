@@ -745,6 +745,18 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		return true;
 
     } else if (kextG11HWT.loadIndex == index) {
+		// V36: Skip TGL GPU driver patching on RPL/ADL (models >= 0xBA).
+		// On RPL, TGL kext loads but remains inactive (patches not applied).
+		// ICL GPU driver takes over — it's stable and has proper Metal init for RPL.
+		// Real TGL: apply all patches normally.
+		const uint32_t cpuModel = NGreen::callback ? NGreen::callback->cpuModel : 0;
+		const bool isRPLorLater = !NGreen::callback->isRealTGL && (cpuModel >= 0xBA);
+		
+		if (isRPLorLater) {
+			SYSLOG("ngreen", "V36: Skipping TGL GPU (HW) patching on RPL-P (Model 0x%x) — ICL GPU will handle Metal", cpuModel);
+			return true;  // TGL kext loaded, but patches skipped
+		}
+		
 		this->tglHWLoaded = true;
 		auto *activeKext = &kextG11HWT;
 		SYSLOG("ngreen", "init AppleIntelTGLGraphics (HW accelerator)");
