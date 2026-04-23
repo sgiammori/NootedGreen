@@ -1090,6 +1090,8 @@ bool  Gen11::getGPUInfo(void *that)
 #define   GEN10_RPM_CONFIG0_CTC_SHIFT_PARAMETER_MASK	(0x3 << GEN10_RPM_CONFIG0_CTC_SHIFT_PARAMETER_SHIFT)
 	
 	auto ret=FunctionCast(getGPUInfo, callback->ogetGPUInfo)(that);
+	const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
+	const bool forceFullMTL = shouldForceFullMetalPath();
 	
 	// --- GPU topology override for RPL i7-13700H (verified from Linux i915 syslog) ---
 	// Linux i915 reports: 1 slice, 6 DSS (mask=0x3f), 16 EU/DSS, 96 EU total.
@@ -1120,7 +1122,15 @@ bool  Gen11::getGPUInfo(void *that)
 	
 	SYSLOG("ngreen", "getGPUInfo: overridden topology → slices=%u subslices=%u maxEU/SS=%u totalEU=%u L3Banks=8",
 		   numSlices, numSubSlices, maxEUPerSubSlice, totalEU);
-			
+
+	// On spoofed platforms in full-MTL mode, do not propagate a false return from
+	// the original path, otherwise accelerator bring-up may abort and CoreDisplay
+	// later receives a null Metal object in RunFullDisplayPipe.
+	if (!isRealTGL && forceFullMTL && !ret) {
+		SYSLOG("ngreen", "getGPUInfo: forcing success on spoofed CPU in full-MTL mode");
+		return true;
+	}
+
 	return ret;
 }
 
