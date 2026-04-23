@@ -1715,11 +1715,6 @@ private:
 
 	static void  prepareToEnterWake(void *that);
 	mach_vm_address_t oprepareToEnterWake {};
-
-	// ADL-P/RPL-P: vccIO=3 and process=2 are out of the TGL fProcMonRefValues table.
-	// Hook clamps them to the maximum valid values (2 and 1) before calling original.
-	static void enableComboPhyEv(void *that);
-	mach_vm_address_t oenableComboPhyEv {};
 	
 public:
 
