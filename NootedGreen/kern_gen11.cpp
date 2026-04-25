@@ -5022,26 +5022,27 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 	getMember<uint64_t>(that, 0x108) = 0;
 	getMember<uint32_t>(that, 0x110) = 0;
 
-	const bool haveBlitHelpers = callback->oIGMappedBuffergetMemory && callback->oblit3d_initialize_scratch_space &&
-		callback->oblit3d_init_ctx;
+	const bool haveBlitHelpers = callback->oIGMappedBuffergetMemory && callback->oblit3d_initialize_scratch_space;
 	if (haveBlitHelpers && mappedBufPtr) {
 		void *sysMem = IGMappedBuffergetMemory(mappedBufPtr);
 		if (sysMem) {
 			if (v69Verbose)
 				SYSLOG("ngreen", "V112: running guarded Blit3D scratch/context init via %p", sysMem);
 			blit3d_initialize_scratch_space(sysMem);
-			blit3d_init_ctx(that);
+			// V113: blit3d_init_ctx writes 0x44 bytes to GPU context buffer+0xD000.
+			// That page is unmapped in the signed com.apple TGL kext regardless of CPU
+			// (same root cause as the original IGHardwareBlit3DContext::initialize crash
+			// that V69 prevents). Skip unconditionally — scratch_space init is sufficient.
 			if (v69Verbose)
-				SYSLOG("ngreen", "V112: Blit3D scratch/context init completed");
+				SYSLOG("ngreen", "V113: skipped blit3d_init_ctx — GPU ctx page 0xD unmapped in signed TGL kext");
 			return;
 		}
 		if (v69Verbose)
 			SYSLOG("ngreen", "V112: IGMappedBuffer::getMemory returned NULL; leaving fallback zero-init in place");
 	} else if (v69Verbose) {
-		SYSLOG("ngreen", "V112: Blit3D helpers unavailable (getMemory=%d scratch=%d initCtx=%d mapped=%p)",
+		SYSLOG("ngreen", "V112: Blit3D helpers unavailable (getMemory=%d scratch=%d mapped=%p)",
 		       callback->oIGMappedBuffergetMemory != 0,
 		       callback->oblit3d_initialize_scratch_space != 0,
-		       callback->oblit3d_init_ctx != 0,
 		       mappedBufPtr);
 	}
 

@@ -91,7 +91,7 @@ These properties are essential for correct platform identification and WEG coexi
 | `-liludbg` | Enable Lilu debug logging |
 | `liludump=60` | Dump Lilu logs after 60 seconds |
 
-## Hookcase And Debug Logs
+## Hookcase
 
 Hookcase (change `AppleInteePortHal` and `AppleIntelPortHal` implementation):
 
@@ -103,9 +103,9 @@ Hookcase (change `AppleInteePortHal` and `AppleIntelPortHal` implementation):
 uint32_t registerValue = callback->readReg32(0x1638a0); // ADL-P/RPL-P
 ```
 
-Useful logs to debug:
+## Useful logs or kp log to debug:
 
-need your logs.. without them I cannot do anything...
+need your logs or kernel panic log.. without them I cannot do anything...
 so you must boot with - for example an empty nblue - inside the system and get previous lilulog and logs related THAT boot.
 
 ```bash
@@ -117,6 +117,7 @@ Example Lilu log path:
 
 ```text
 /private/var/log/Lilu_1.7.2_23.6.txt
+/Libtary/Logs/DiagnosticReports/..
 ```
 
 Additional developer note:
@@ -132,9 +133,11 @@ https://github.com/sgiammori/NootedGreen
 IOResources solving now is done like this for TGL kexts or IcL ketxts : first look at LE kexts and if any kexts is found than fallback to find in SLE kexts : * framebuffer for fb * + * graphics for gpu * + * bundle for metal *
 
 they (also Bookcase) need permissions fix so before move to /L/E do in some random folder (maybe better use our Lilu plugin forked for IOResources eventually problems...
+```
 
-Workflow for kexts (fb+Graphics+Hookcase in LE)
+## Workflow for kexts (fb+Graphics+Hookcase in LE)
 
+```
 - sudo chmod -R 755 Apple*
 - sudo chown -R root:wheel Apple*
 - move the files to /L/E
