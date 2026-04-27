@@ -6567,16 +6567,19 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		uint32_t bHead = NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE));
 		uint32_t bTail = NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE));
 		uint32_t err   = NGreen::callback->readReg32(ERROR_GEN6);
-		if (rCtl == 0 && rHead == rTail && bCtl == 0 && bHead == bTail && err == 0) {
+		// V156: drop rCtl==0 / bCtl==0 requirement — V155 restores CTL to 0x7000/0x7001
+		// before this check, so the ring is no longer disabled. Quiescence only
+		// requires HEAD==TAIL (empty queue) and no pending errors.
+		if (rHead == rTail && bHead == bTail && err == 0) {
 			// V155: re-enable the RCS ring before returning fake success.
-			// The original reset (run on earlier calls) disabled it (CTL→0x0).
-			// Apple's ring monitor sees CTL=0x0 and keeps requesting resets.
-			// Restoring CTL makes the ring look healthy: enabled + HEAD==TAIL == idle.
+			// Use | 1 to force RING_ENABLE (bit 0) — hardware clears it after write,
+			// so subsequent snapshots read 0x7000 instead of 0x7001; always restore
+			// with RING_ENABLE set or the ring DMA stays disabled.
 			if (v155SavedRcsCtl != 0) {
-				NGreen::callback->writeReg32(RING_CTL(RENDER_RING_BASE), v155SavedRcsCtl);
+				NGreen::callback->writeReg32(RING_CTL(RENDER_RING_BASE), v155SavedRcsCtl | 1);
 			}
-			SYSLOG("ngreen", "V154[%d]: circuit-open — skipping original reset (%d consec quiescent fails, restored CTL=0x%x)",
-			       v63ResetCount, v154ConsecQuiescentFails, v155SavedRcsCtl);
+			SYSLOG("ngreen", "V154[%d]: circuit-open — skipping original reset (%d consec quiescent fails, rCtl=0x%x rHead=0x%x bHead=0x%x restored CTL=0x%x)",
+			       v63ResetCount, v154ConsecQuiescentFails, rCtl, rHead, bHead, v155SavedRcsCtl | 1);
 			return 0;
 		}
 		// State changed — open circuit no longer valid, reset counter
@@ -6610,17 +6613,21 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 	}
 
 	// V155: Capture RCS CTL while the ring is still intact (before original disables it).
+	// Always OR with 1 so the saved value includes RING_ENABLE — hardware reads bit 0 back
+	// as 0 once the ring is running ('write-to-enable, reads as 0'), but we must write 1
+	// to actually enable the ring when we restore it.
 	{
 		uint32_t ctlNow = NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE));
 		if (ctlNow != 0)
-			v155SavedRcsCtl = ctlNow;
+			v155SavedRcsCtl = ctlNow | 1;
 	}
 
 	// V53: Snapshot engine state BEFORE original resetGraphicsEngine
-	SYSLOG("ngreen", "V53 resetGfxEng PRE: RCS CTL=0x%x HEAD=0x%x TAIL=0x%x (V155 saved=0x%x)",
+	SYSLOG("ngreen", "V53 resetGfxEng PRE: RCS CTL=0x%x HEAD=0x%x TAIL=0x%x EXEC=0x%x (V155 saved=0x%x)",
 		NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE)),
 		NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE)),
 		NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE)),
 		v155SavedRcsCtl);
 	SYSLOG("ngreen", "V53 resetGfxEng PRE: BCS CTL=0x%x HEAD=0x%x TAIL=0x%x",
 		NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE)),
@@ -6630,7 +6637,7 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		NGreen::callback->readReg32(ERROR_GEN6),
 		NGreen::callback->readReg32(RING_MI_MODE(RENDER_RING_BASE)),
 		NGreen::callback->readReg32(RING_MI_MODE(BLT_RING_BASE)));
-	
+
 	auto ret=FunctionCast(resetGraphicsEngine, callback->oresetGraphicsEngine)(that,param_1);
 	
 	// V53: Snapshot AFTER — did original reset change anything?
@@ -6665,23 +6672,25 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		uint32_t rcsCtl = NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE));
 		uint32_t rcsHead = NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE));
 		uint32_t rcsTail = NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE));
-		uint32_t bcsCtl = NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE));
-		uint32_t bcsHead = NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE));
-		uint32_t bcsTail = NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE));
 		uint32_t err = NGreen::callback->readReg32(ERROR_GEN6);
 
+		// V156: Drop BCS quiescent requirement. The original reset changes BCS HEAD/TAIL
+		// unpredictably for the first N calls, so bcsHead!=bcsTail prevented V153 from
+		// firing until call #7. RCS quiescence (CTL=0 + HEAD==TAIL) + no error is
+		// sufficient: the ring was successfully drained; BCS state is irrelevant here
+		// since V152 already disabled/drained it before the original call.
 		const bool rcsQuiescent = (rcsCtl == 0 && rcsHead == rcsTail);
-		const bool bcsQuiescent = (bcsCtl == 0 && bcsHead == bcsTail);
-		if (rcsQuiescent && bcsQuiescent && err == 0) {
+		if (rcsQuiescent && err == 0) {
 			v154ConsecQuiescentFails++;
 			// V155: re-enable the RCS ring — original reset left it at CTL=0x0.
-			// Without this, Apple's ring monitor sees CTL=0 → keeps requesting resets.
-			// With CTL restored + HEAD==TAIL (idle), the ring looks healthy.
+			// Use | 1 to force RING_ENABLE bit — hardware clears it on readback, so
+			// v155SavedRcsCtl may already have been updated to 0x7000; we must always
+			// write with bit 0 set for the ring to actually start executing commands.
 			if (v155SavedRcsCtl != 0) {
-				NGreen::callback->writeReg32(RING_CTL(RENDER_RING_BASE), v155SavedRcsCtl);
+				NGreen::callback->writeReg32(RING_CTL(RENDER_RING_BASE), v155SavedRcsCtl | 1);
 			}
-			SYSLOG("ngreen", "V153[%d]: coercing reset ret=1025 -> 0 (quiescent, consec=%d, restored CTL=0x%x)",
-			       v63ResetCount, v154ConsecQuiescentFails, v155SavedRcsCtl);
+			SYSLOG("ngreen", "V153[%d]: coercing reset ret=1025 -> 0 (rcs-quiescent, consec=%d, restored CTL=0x%x)",
+			       v63ResetCount, v154ConsecQuiescentFails, v155SavedRcsCtl | 1);
 			return 0;
 		}
 	}
