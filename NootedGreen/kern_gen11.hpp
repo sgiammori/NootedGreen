@@ -8,6 +8,7 @@
 #include "Firmware.hpp"
 #include "kern_patcherplus.hpp"
 #include <Headers/kern_util.hpp>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 
 // ─── DMC (Display Microcontroller) firmware structures ──────────────────────
 // Used to parse Intel DMC firmware blobs for display power management
@@ -1294,10 +1295,21 @@ private:
 	static void v71EmrEnforcer(thread_call_param_t, thread_call_param_t);  // V71: high-freq EMR mask + ERROR clear (50ms)
 	static IOMemoryMap *v85PersistMap;   // V85: persistent FB page 0 mapping for 50ms fill
 	static uint32_t v85SurfAddr;         // V85: cached PLANE_SURF address
+	static IOBufferMemoryDescriptor *v116DummyBuf;  // V116: safe dummy page for GGTT[0] remap
+	static uint64_t v116DummyPhys;                  // V116: physical address of dummy page
 	mach_vm_address_t ostart {};
 
 	static bool deviceStart(void *that);   // V111: force IGAccelDevice::deviceStart true on RPL
 	mach_vm_address_t odeviceStart {};
+
+	static void *createUserGPUTask(void *that);  // V132: fallback when per-user task creation returns null on spoofed RPL
+	mach_vm_address_t ocreateUserGPUTask {};
+
+	static void *igAccelTaskWithOptions(void *that);  // V132: cache successful task allocations for null-task fallback
+	mach_vm_address_t oigAccelTaskWithOptions {};
+	
+	static uint32_t submitBlit(void *that, void *param_1, void *param_2, void *param_3, bool param_4);
+	mach_vm_address_t osubmitBlit {};
 	
 	static bool patchRCSCheck(mach_vm_address_t& start);  // bypass RCS engine check
 	static void forceWake(void *that, bool set, uint32_t dom, uint8_t ctx);  // custom forcewake
@@ -1390,6 +1402,11 @@ private:
 	bool isICLFB {false};   // true when loaded under AppleIntelICLLPGraphicsFramebuffer
 	bool tglFBLoaded {false};  // true when TGL FB processed — skip ICL FB if set
 	bool tglHWLoaded {false};  // true when TGL HW processed — skip ICL HW if set
+
+	// V131: Cached fallback contexts for spoofed RPL path to prevent NULL task submission
+	void *v131CachedBlit3DCtx {nullptr};  // Fallback 3D context when creation fails
+	void *v131CachedBlit2DCtx {nullptr};  // Fallback 2D context when creation fails
+	void *v132CachedTask {nullptr};       // Fallback IGAccelTask when per-user task creation fails
 
 	static void hwConfigureCustomAUX(void *that,bool param_1);
 	mach_vm_address_t ohwConfigureCustomAUX {};
@@ -1596,7 +1613,7 @@ private:
 	static void * IGMappedBuffergetMemory(void *that);
 	mach_vm_address_t oIGMappedBuffergetMemory {};
 	
-	static void *  IGHardwareBlit3DContextoperatornew(void *that,unsigned long param_1);
+	static void *  IGHardwareBlit3DContextoperatornew(unsigned long size);
 	mach_vm_address_t oIGHardwareBlit3DContextoperatornew {};
 	
 	
@@ -1634,6 +1651,12 @@ private:
 	
 	static void * getBlit2DContext(void *that,bool param_1);
 	mach_vm_address_t ogetBlit2DContext {};
+
+	static void * getDepthResolveContext(void *that,bool param_1);
+	mach_vm_address_t ogetDepthResolveContext {};
+
+	static void * getColorResolveContext(void *that,bool param_1);
+	mach_vm_address_t ogetColorResolveContext {};
 	
 	static void * ExtendedContextWithOptions(void *param_1);
 	mach_vm_address_t oExtendedContextWithOptions {};
@@ -1698,6 +1721,13 @@ private:
 
 	static uint32_t  IGAccelSegmentResourceListprepare(void *that);  // GPU memory segment setup
 	mach_vm_address_t oIGAccelSegmentResourceListprepare {};
+
+	static uint32_t beginCoalescedSegment(void *that);  // V124: guard [member+0xb8] null deref
+	mach_vm_address_t obeginCoalescedSegment {};
+
+	static uint8_t barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
+	                                void *event, uint16_t count, const uint16_t *list);
+	mach_vm_address_t obarrierSubmission {};
 	
 	static void  markBlitUsage(void *that);
 	mach_vm_address_t omarkBlitUsage {};

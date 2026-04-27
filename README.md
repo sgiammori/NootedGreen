@@ -1,4 +1,4 @@
-# NootedGreen
+# NootedGreen (tested on Sonoma and with RPL (!realTGL) machine..)
 
 Lilu plugin for Intel iGPU acceleration on macOS — Haswell through Raptor Lake, via Tiger Lake driver spoofing.
 
