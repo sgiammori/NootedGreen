@@ -819,14 +819,14 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		 // value from ever reaching the DMA buffer.
 		 {"__ZN16IntelAccelerator19startGraphicsEngineEv", startGraphicsEngine, this->ostartGraphicsEngine},
 
-		 // resetGraphicsEngine: apply RPL GT workarounds (Wa_14011060649, Wa_14011059788, Wa_14015795083)
-			 // before the original TGL engine reset. Without these, GPU hangs on first 3D command.
-			 {"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext", resetGraphicsEngine, this->oresetGraphicsEngine},
-			
-			 // start: inject MultiForceWakeSelect=1 into Development dictionary BEFORE original start.
-			 // This tells the accelerator to use our hooked SafeForceWakeMultithreaded instead of
-			 // the framebuffer's SafeForceWake (which fails on RPL-P with ForceWake ACK=0).
-			 {"__ZN16IntelAccelerator5startEP9IOService", start, this->ostart},
+		 // V164: Hook populateResetRegisterList which reads live MMIO values into the per-context
+		 // replay list (a batch of MI_LRI commands executed before every context switch).
+		 // startGraphicsEngine enables PERCTX_PREEMPT_CTRL then calls populateResetRegisterList,
+		 // which snapshots the live 0x4000 into the list. Hardware then replays 0x4000 back to
+		 // 0x20E0 on every context switch, overriding any post-hoc MMIO clear.
+		 // Fix: clear bit 14 BEFORE calling original so the snapshot captures 0x0000.
+		 {"__ZN16IntelAccelerator25populateResetRegisterListEv", populateResetRegisterList, this->opopulateResetRegisterList},
+
 
 			 // V132: Hook task producers so submitBlit never sees a null IGAccelTask on spoofed RPL.
 			 {"__ZN16IntelAccelerator17createUserGPUTaskEv", createUserGPUTask, this->ocreateUserGPUTask},
@@ -6503,6 +6503,28 @@ void Gen11::IGScheduler5resume(void *that) {
 	
 	FunctionCast(IGScheduler5resume, callback->oIGScheduler5resume)(that);
 	
+}
+
+// V164: Hook populateResetRegisterList to clear PERCTX_PREEMPT_CTRL before snapshot.
+//
+// IntelAccelerator::startGraphicsEngine writes 0x40004000 to 0x20E0, then calls
+// populateResetRegisterList which reads the live MMIO value via [rax+20E0h] and stores
+// it into a per-context replay list (a batch of MI_LRI commands replayed before every
+// context switch). If 0x4000 is snapshotted into that list, hardware perpetually
+// replays it back, overriding any post-hoc MMIO clear (V162/V163 arrive too late).
+//
+// Fix: clear bit 14 BEFORE calling original so the snapshot captures 0x0000,
+// making the replay batch write 0x0000 to 0x20E0 on every context switch instead.
+void Gen11::populateResetRegisterList(void *that)
+{
+	if (!NGreen::callback->isRealTGL) {
+		// Masked clear: mask=bit14, value=0 → 0x40000000
+		NGreen::callback->writeReg32(GEN7_FF_SLICE_CS_CHICKEN1,
+			(GEN9_FFSC_PERCTX_PREEMPT_CTRL << 16) | 0);
+		SYSLOG("ngreen", "V164: pre-snapshot clear FF_SLICE_CS_CHICKEN1=0x%08x",
+			NGreen::callback->readReg32(GEN7_FF_SLICE_CS_CHICKEN1));
+	}
+	FunctionCast(populateResetRegisterList, callback->opopulateResetRegisterList)(that);
 }
 
 // V163: Hook startGraphicsEngine to clear PERCTX_PREEMPT_CTRL before first execlist context snapshot.

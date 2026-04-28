@@ -1721,6 +1721,9 @@ private:
 	static bool startGraphicsEngine(void *that);  // V163: clear PERCTX_PREEMPT_CTRL before first context snapshot
 	mach_vm_address_t ostartGraphicsEngine {};
 
+	static void populateResetRegisterList(void *that);  // V164: clear bit 14 before snapshot into replay list
+	mach_vm_address_t opopulateResetRegisterList {};
+
 	static void  IGScheduler5resume(void *that);  // GPU command scheduler resume
 	mach_vm_address_t oIGScheduler5resume {};
 
