@@ -6554,31 +6554,44 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		NGreen::callback->writeReg32(RING_EMR(BLT_RING_BASE), 0xFFFFFFFF);
 	}
 
-	// V158: cancel pending execlist contexts + drain CSB after any fake-success return.
-	// After V153/V154 return 0, EXEC stays at 0x40018098 (execlist FIFO stuck) and CSB
-	// pointer shows 15+ unread entries. Apple's driver sees these as "engine still busy"
-	// and keeps scheduling resets even though V154 returns instantly. Fix: write four
-	// null descriptors to RING_ELSP to cancel EL0+EL1, then advance CSB read pointer
-	// to match write pointer so all pending status entries are consumed.
-	auto v158_clearExeclist = [&]() {
-		// Two null context descriptors (hi:lo each) cancel both execlist submission ports.
-		// Port 1 is submitted first (higher index written first per i915 ELSP protocol),
-		// then port 0 (the active/priority port).
-		NGreen::callback->writeReg32(RING_ELSP(RENDER_RING_BASE), 0);
-		NGreen::callback->writeReg32(RING_ELSP(RENDER_RING_BASE), 0);
-		NGreen::callback->writeReg32(RING_ELSP(RENDER_RING_BASE), 0);
-		NGreen::callback->writeReg32(RING_ELSP(RENDER_RING_BASE), 0);
-		// Advance CSB read pointer to write pointer — consumes all pending entries.
-		uint32_t csbReg = NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
+	// V158: drain CSB read pointer after any fake-success return.
+	//
+	// Boot log confirmed: RING_ELSP null writes (4×0) do NOT clear EXEC bit 30.
+	// EXEC=0x40018098 is a permanent hardware state on RPL — the EL0 "active" slot holds
+	// a context descriptor set during initial ring init (IGHardwareCommandStreamer5::start)
+	// that never completed because the context-complete interrupt/CSB write from RPL silicon
+	// doesn't fire with TGL microcode. CTX_CTRL=0x10 (bit 4) is set on that stuck context.
+	// Null ELSP writes only affect the pending EL1 slot; the EL0 active slot is unaffected.
+	//
+	// V159: Attempt CTX_CTRL force-abandon before CSB drain.
+	// Standard i915 engine-quiesce sequence (used in __intel_gt_disable / engine reset prep):
+	//   bit 0 (ENGINE_CTX_RESTORE_INHIBIT): prevent context restore on next switch
+	//   bit 2 (ENGINE_CTX_SAVE_INHIBIT):    skip context save on preemption (discard)
+	//   bit 3 (INHIBIT_SYN_CTX_SWITCH):     immediate/async switch, no sync
+	// Together these force hardware to abandon the stuck EL0 context without saving it.
+	// Candidate outcome: EXEC bit 30 clears → EL0 slot freed → ring can execute commands.
+	//
+	// CSB drain is also kept.
+	auto v158_drainCSB = [&]() {
+		// V159: write CTX_CTRL_FORCE_ABANDON to kick the stuck EL0 context out.
+		uint32_t ctxCtrlBefore = NGreen::callback->readReg32(RING_CTX_CTRL(RENDER_RING_BASE));
+		NGreen::callback->writeReg32(RING_CTX_CTRL(RENDER_RING_BASE), CTX_CTRL_FORCE_ABANDON);
+		uint32_t ctxCtrlAfter  = NGreen::callback->readReg32(RING_CTX_CTRL(RENDER_RING_BASE));
+
+		// Advance CSB read pointer to write pointer — consume all pending status entries.
+		uint32_t csbReg   = NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
 		uint32_t csbWrite = (csbReg >> 8) & 0xff;
 		uint32_t csbRead  = csbReg & 0xff;
 		if (csbRead != csbWrite) {
 			NGreen::callback->writeReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE),
 			                              (csbWrite << 8) | csbWrite);
 		}
-		uint32_t execAfter = NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE));
-		SYSLOG("ngreen", "V158[%d]: ELSP cleared, CSB %d->%d, EXEC now 0x%x",
-		       v63ResetCount, csbRead, csbWrite, execAfter);
+
+		// Read EXEC after CTX_CTRL write to see if EL0 was released.
+		uint32_t execNow = NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE));
+		SYSLOG("ngreen", "V159[%d]: CTX_CTRL 0x%x->0x%x (wrote 0x%x), CSB rp %d->%d, EXEC=0x%x",
+		       v63ResetCount, ctxCtrlBefore, ctxCtrlAfter, CTX_CTRL_FORCE_ABANDON,
+		       csbRead, csbWrite, execNow);
 	};
 
 	// V154: RPL-only circuit-breaker — after 3 consecutive quiescent ret=1025 resets,
@@ -6607,7 +6620,7 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 			}
 			SYSLOG("ngreen", "V154[%d]: circuit-open — skipping original reset (%d consec quiescent fails, rCtl=0x%x rHead=0x%x bHead=0x%x restored CTL=0x%x)",
 			       v63ResetCount, v154ConsecQuiescentFails, rCtl, rHead, bHead, v155SavedRcsCtl | 1);
-			v158_clearExeclist();
+			v158_drainCSB();
 			return 0;
 		}
 		// State changed — open circuit no longer valid, reset counter
@@ -6717,7 +6730,7 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 			if (v155SavedRcsCtl != 0) {
 				NGreen::callback->writeReg32(RING_CTL(RENDER_RING_BASE), v155SavedRcsCtl | 1);
 			}
-			v158_clearExeclist();
+			v158_drainCSB();
 			SYSLOG("ngreen", "V153[%d]: coercing reset ret=1025 -> 0 (rcs-quiescent, consec=%d, restored CTL=0x%x)",
 			       v63ResetCount, v154ConsecQuiescentFails, v155SavedRcsCtl | 1);
 			return 0;

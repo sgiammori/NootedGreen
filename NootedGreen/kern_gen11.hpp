@@ -262,6 +262,14 @@ struct PACKED intel_dmc_header_v3 {
 #define RING_CTX_SIZE(base)			((base) + 0x1a0) /* context size */
 #define RING_CCID(base)				((base) + 0x180) /* context control ID */
 #define RING_CTX_CTRL(base)			((base) + 0x244) /* context control */
+/* RING_CTX_CTRL bit definitions (GEN8+/GEN12) */
+#define CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT	(1 << 0)  /* bit 0: inhibit context restore on context switch */
+#define CTX_CTRL_ENGINE_CTX_SAVE_INHIBIT	(1 << 2)  /* bit 2: inhibit context save on preemption */
+#define CTX_CTRL_INHIBIT_SYN_CTX_SWITCH	(1 << 3)  /* bit 3: force immediate (async) context switch */
+/* Writing bits 0+2+3 = 0x0D forces context abandon: no restore, no save, immediate switch.
+ * This is the i915 engine-quiesce sequence used before __intel_gt_disable(). */
+#define CTX_CTRL_FORCE_ABANDON \
+	(CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT | CTX_CTRL_ENGINE_CTX_SAVE_INHIBIT | CTX_CTRL_INHIBIT_SYN_CTX_SWITCH)
 #define RING_ELSP(base)				((base) + 0x230) /* ExecList Submission Port */
 #define RING_EXECLIST_STATUS(base)	((base) + 0x234)
 #define RING_CONTEXT_STATUS_PTR(base) ((base) + 0x3a0)
