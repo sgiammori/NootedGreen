@@ -6669,17 +6669,17 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 	// Preserve real TGL behavior; on spoofed RPL only, treat this specific
 	// quiescent 1025 as success so callers can progress beyond reset storm.
 	if (!NGreen::callback->isRealTGL && ret == 1025) {
-		uint32_t rcsCtl = NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE));
 		uint32_t rcsHead = NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE));
 		uint32_t rcsTail = NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE));
 		uint32_t err = NGreen::callback->readReg32(ERROR_GEN6);
 
-		// V156: Drop BCS quiescent requirement. The original reset changes BCS HEAD/TAIL
-		// unpredictably for the first N calls, so bcsHead!=bcsTail prevented V153 from
-		// firing until call #7. RCS quiescence (CTL=0 + HEAD==TAIL) + no error is
-		// sufficient: the ring was successfully drained; BCS state is irrelevant here
-		// since V152 already disabled/drained it before the original call.
-		const bool rcsQuiescent = (rcsCtl == 0 && rcsHead == rcsTail);
+		// V156: Drop BCS quiescent requirement — irrelevant since V152 handles BCS.
+		// V157: Drop rcsCtl==0 check. Hardware auto-restores RCS CTL to 0x7001 within
+		// microseconds after the original reset (likely via execlist engine re-enabling).
+		// By the time V153 reads CTL it is already 0x7001, making rcsCtl==0 always false
+		// and preventing V153 from ever firing in the first ~15 calls. Only HEAD==TAIL
+		// (empty ring queue) and err==0 are needed to confirm the ring is quiescent.
+		const bool rcsQuiescent = (rcsHead == rcsTail);
 		if (rcsQuiescent && err == 0) {
 			v154ConsecQuiescentFails++;
 			// V155: re-enable the RCS ring — original reset left it at CTL=0x0.
