@@ -6556,28 +6556,11 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 
 	// V158: drain CSB read pointer after any fake-success return.
 	//
-	// Boot log confirmed: RING_ELSP null writes (4×0) do NOT clear EXEC bit 30.
-	// EXEC=0x40018098 is a permanent hardware state on RPL — the EL0 "active" slot holds
-	// a context descriptor set during initial ring init (IGHardwareCommandStreamer5::start)
-	// that never completed because the context-complete interrupt/CSB write from RPL silicon
-	// doesn't fire with TGL microcode. CTX_CTRL=0x10 (bit 4) is set on that stuck context.
-	// Null ELSP writes only affect the pending EL1 slot; the EL0 active slot is unaffected.
-	//
-	// V159: Attempt CTX_CTRL force-abandon before CSB drain.
-	// Standard i915 engine-quiesce sequence (used in __intel_gt_disable / engine reset prep):
-	//   bit 0 (ENGINE_CTX_RESTORE_INHIBIT): prevent context restore on next switch
-	//   bit 2 (ENGINE_CTX_SAVE_INHIBIT):    skip context save on preemption (discard)
-	//   bit 3 (INHIBIT_SYN_CTX_SWITCH):     immediate/async switch, no sync
-	// Together these force hardware to abandon the stuck EL0 context without saving it.
-	// Candidate outcome: EXEC bit 30 clears → EL0 slot freed → ring can execute commands.
-	//
-	// CSB drain is also kept.
+	// V159 confirmed CTX_CTRL is read-only while EL0 is active:
+	// writing CTX_CTRL_FORCE_ABANDON (0x0D) was silently ignored — 0x10->0x10 on readback.
+	// Hardware only evicts the stuck ring-init EL0 context via a domain reset (GDRST).
+	// V160: GDRST is attempted once in the V153 path; this lambda is now just CSB drain.
 	auto v158_drainCSB = [&]() {
-		// V159: write CTX_CTRL_FORCE_ABANDON to kick the stuck EL0 context out.
-		uint32_t ctxCtrlBefore = NGreen::callback->readReg32(RING_CTX_CTRL(RENDER_RING_BASE));
-		NGreen::callback->writeReg32(RING_CTX_CTRL(RENDER_RING_BASE), CTX_CTRL_FORCE_ABANDON);
-		uint32_t ctxCtrlAfter  = NGreen::callback->readReg32(RING_CTX_CTRL(RENDER_RING_BASE));
-
 		// Advance CSB read pointer to write pointer — consume all pending status entries.
 		uint32_t csbReg   = NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
 		uint32_t csbWrite = (csbReg >> 8) & 0xff;
@@ -6586,12 +6569,9 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 			NGreen::callback->writeReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE),
 			                              (csbWrite << 8) | csbWrite);
 		}
-
-		// Read EXEC after CTX_CTRL write to see if EL0 was released.
 		uint32_t execNow = NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE));
-		SYSLOG("ngreen", "V159[%d]: CTX_CTRL 0x%x->0x%x (wrote 0x%x), CSB rp %d->%d, EXEC=0x%x",
-		       v63ResetCount, ctxCtrlBefore, ctxCtrlAfter, CTX_CTRL_FORCE_ABANDON,
-		       csbRead, csbWrite, execNow);
+		SYSLOG("ngreen", "V160[%d]: CSB rp %d->%d, EXEC=0x%x",
+		       v63ResetCount, csbRead, csbWrite, execNow);
 	};
 
 	// V154: RPL-only circuit-breaker — after 3 consecutive quiescent ret=1025 resets,
@@ -6723,7 +6703,33 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		const bool rcsQuiescent = (rcsHead == rcsTail);
 		if (rcsQuiescent && err == 0) {
 			v154ConsecQuiescentFails++;
-			// V155: re-enable the RCS ring — original reset left it at CTL=0x0.
+
+			// V160: one-shot GEN6_GDRST render-domain reset.
+			// V159 confirmed CTX_CTRL writes are ignored while EL0 is active.
+			// A hardware domain reset (Linux i915: gen6_hw_domain_reset) is the only
+			// mechanism that can evict the stuck ring-init EL0 context. Apple's
+			// resetGraphicsEngine presumably does something similar but times out due
+			// to an interrupt/CSB-handshake mismatch on RPL; we bypass that by writing
+			// GEN6_GDRST directly. After GDRST the ring CTL is 0 — V155 restores it.
+			static bool v160GdrstFired = false;
+			if (!v160GdrstFired) {
+				v160GdrstFired = true;
+				uint32_t execBefore = NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE));
+				NGreen::callback->writeReg32(GEN6_GDRST, GEN6_GRDOM_RENDER);
+				// Poll for self-clear — hardware sets bit while reset is in progress,
+				// clears it when done. Typically <1 ms; cap at 1000 reads.
+				uint32_t gdrstVal = GEN6_GRDOM_RENDER;
+				int pollCount = 0;
+				while ((gdrstVal & GEN6_GRDOM_RENDER) && pollCount < 1000) {
+					gdrstVal = NGreen::callback->readReg32(GEN6_GDRST);
+					pollCount++;
+				}
+				uint32_t execAfter = NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE));
+				SYSLOG("ngreen", "V160[%d]: GDRST render reset poll=%d gdrst=0x%x, EXEC 0x%x->0x%x",
+				       v63ResetCount, pollCount, gdrstVal, execBefore, execAfter);
+			}
+
+			// V155: re-enable the RCS ring — GDRST (and the original reset) leave CTL=0.
 			// Use | 1 to force RING_ENABLE bit — hardware clears it on readback, so
 			// v155SavedRcsCtl may already have been updated to 0x7000; we must always
 			// write with bit 0 set for the ring to actually start executing commands.
