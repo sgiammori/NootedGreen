@@ -3254,8 +3254,14 @@ bool Gen11::start(void *that,void  *param_1)
 	uint32_t mcr = GEN8_MCR_SLICE(0) | GEN8_MCR_SUBSLICE(0);
 	uint32_t mcr_mask = GEN8_MCR_SLICE_MASK | GEN8_MCR_SUBSLICE_MASK;
 	NGreen::callback->wa_write_clr_set(GEN8_MCR_SELECTOR, mcr_mask, mcr);
-	NGreen::callback->wa_masked_en(GEN7_FF_SLICE_CS_CHICKEN1,
-			GEN9_FFSC_PERCTX_PREEMPT_CTRL);
+	// V162: PERCTX_PREEMPT_CTRL (bit 14) is a TGL-specific workaround that bakes
+	// into the execlist context image template.  On RPL the bit freezes the EU
+	// thread dispatcher on the first Metal context-image DMA restore.  Only enable
+	// it on genuine TGL hardware.
+	if (NGreen::callback->isRealTGL) {
+		NGreen::callback->wa_masked_en(GEN7_FF_SLICE_CS_CHICKEN1,
+				GEN9_FFSC_PERCTX_PREEMPT_CTRL);
+	}
 	
 	SYSLOG("ngreen", "Pre-start: GT workarounds applied, calling original start()");
 	
@@ -6601,6 +6607,10 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 			SYSLOG("ngreen", "V154[%d]: circuit-open — skipping original reset (%d consec quiescent fails, rCtl=0x%x rHead=0x%x bHead=0x%x restored CTL=0x%x)",
 			       v63ResetCount, v154ConsecQuiescentFails, rCtl, rHead, bHead, v155SavedRcsCtl | 1);
 			v158_drainCSB();
+			// V162: Clear PERCTX_PREEMPT_CTRL — TGL context image sets bit 14;
+			// RPL EU thread dispatcher freezes with this bit enabled.
+			NGreen::callback->writeReg32(GEN7_FF_SLICE_CS_CHICKEN1,
+				(GEN9_FFSC_PERCTX_PREEMPT_CTRL << 16) | 0);
 			return 0;
 		}
 		// State changed — open circuit no longer valid, reset counter
@@ -6702,7 +6712,19 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		NGreen::callback->readReg32(GEN7_FF_SLICE_CS_CHICKEN1),
 		NGreen::callback->readReg32(GEN8_CS_CHICKEN1),
 		NGreen::callback->readReg32(0x229c));
-	
+
+	// V162: After every reset on RPL, forcibly clear PERCTX_PREEMPT_CTRL (bit 14
+	// of FF_SLICE_CS_CHICKEN1).  The TGL execlist context image has this bit set
+	// as a TGL-only chicken bit; on RPL it causes the EU thread dispatcher to hang
+	// permanently on the first Metal render submission.  The masked-write format
+	// (upper 16 = mask, lower 16 = value) clears the bit without touching others.
+	if (!NGreen::callback->isRealTGL) {
+		NGreen::callback->writeReg32(GEN7_FF_SLICE_CS_CHICKEN1,
+			(GEN9_FFSC_PERCTX_PREEMPT_CTRL << 16) | 0);  // 0x40000000: mask bit 14 → 0
+		SYSLOG("ngreen", "V162[%d]: cleared PERCTX_PREEMPT_CTRL, FF_SLICE_CS_CHICKEN1 now=0x%08x",
+			v63ResetCount, NGreen::callback->readReg32(GEN7_FF_SLICE_CS_CHICKEN1));
+	}
+
 	// V71: Post-reset error suppression — Apple's resetGraphicsEngine may unmask EMR
 	// or generate new errors during reset. Re-mask and clear immediately after.
 	{
@@ -6771,6 +6793,10 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 			v158_drainCSB();
 			SYSLOG("ngreen", "V153[%d]: coercing reset ret=1025 -> 0 (rcs-quiescent, consec=%d, restored CTL=0x%x)",
 			       v63ResetCount, v154ConsecQuiescentFails, v155SavedRcsCtl | 1);
+			// V162: Clear PERCTX_PREEMPT_CTRL — TGL context image sets bit 14;
+			// RPL EU thread dispatcher freezes with this bit enabled.
+			NGreen::callback->writeReg32(GEN7_FF_SLICE_CS_CHICKEN1,
+				(GEN9_FFSC_PERCTX_PREEMPT_CTRL << 16) | 0);
 			return 0;
 		}
 	}
