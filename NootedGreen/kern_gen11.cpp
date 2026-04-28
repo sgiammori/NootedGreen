@@ -6659,6 +6659,27 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		NGreen::callback->readReg32(RING_MI_MODE(RENDER_RING_BASE)),
 		NGreen::callback->readReg32(RING_MI_MODE(BLT_RING_BASE)));
 
+	// V161: EU/context-image state snapshot — every reset call.
+	// These six registers are restored from the context image by hardware DMA on each
+	// context load. If the TGL image writes values incompatible with RPL silicon, they
+	// will show up here with the wrong bits set and point to what needs patching.
+	//   0x206c = INSTDONE_1        — EU thread dispatcher / slice done bits (all 1 = idle)
+	//   0x2090 = COMMON_SLICE_INSTDONE — fixed-function and EU execution units (all 1 = idle)
+	//   0x20a0 = FF_THREAD_MODE    — fixed-function thread dispatch mode
+	//   0x20e0 = FF_SLICE_CS_CHICKEN1 — bit 14 = PERCTX_PREEMPT_CTRL (TGL enables; RPL hangs)
+	//   0x2580 = CS_CHICKEN1       — bits [3:1] = GPGPU preemption level
+	//   0x229c = GFX_MODE (RCS)    — bit 3 = GFX_DISABLE_LEGACY_MODE; upper 16 = mask
+	SYSLOG("ngreen", "V161[%d]: INSTDONE_1=0x%08x SLICE_INSTDONE=0x%08x FF_THREAD_MODE=0x%08x",
+		v63ResetCount,
+		NGreen::callback->readReg32(0x206c),
+		NGreen::callback->readReg32(0x2090),
+		NGreen::callback->readReg32(GEN7_FF_THREAD_MODE));
+	SYSLOG("ngreen", "V161[%d]: FF_SLICE_CS_CHICKEN1=0x%08x CS_CHICKEN1=0x%08x GFX_MODE=0x%08x",
+		v63ResetCount,
+		NGreen::callback->readReg32(GEN7_FF_SLICE_CS_CHICKEN1),
+		NGreen::callback->readReg32(GEN8_CS_CHICKEN1),
+		NGreen::callback->readReg32(0x229c));
+
 	auto ret=FunctionCast(resetGraphicsEngine, callback->oresetGraphicsEngine)(that,param_1);
 	
 	// V53: Snapshot AFTER — did original reset change anything?
@@ -6670,6 +6691,17 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 	SYSLOG("ngreen", "V53 resetGfxEng POST: BCS CTL=0x%x ERROR_GEN6=0x%x",
 		NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE)),
 		NGreen::callback->readReg32(ERROR_GEN6));
+	// V161 POST: same six registers after reset — shows what the original reset restores/clears.
+	SYSLOG("ngreen", "V161[%d]post: INSTDONE_1=0x%08x SLICE_INSTDONE=0x%08x FF_THREAD_MODE=0x%08x",
+		v63ResetCount,
+		NGreen::callback->readReg32(0x206c),
+		NGreen::callback->readReg32(0x2090),
+		NGreen::callback->readReg32(GEN7_FF_THREAD_MODE));
+	SYSLOG("ngreen", "V161[%d]post: FF_SLICE_CS_CHICKEN1=0x%08x CS_CHICKEN1=0x%08x GFX_MODE=0x%08x",
+		v63ResetCount,
+		NGreen::callback->readReg32(GEN7_FF_SLICE_CS_CHICKEN1),
+		NGreen::callback->readReg32(GEN8_CS_CHICKEN1),
+		NGreen::callback->readReg32(0x229c));
 	
 	// V71: Post-reset error suppression — Apple's resetGraphicsEngine may unmask EMR
 	// or generate new errors during reset. Re-mask and clear immediately after.
