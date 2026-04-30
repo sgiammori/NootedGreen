@@ -241,7 +241,7 @@
 			<key>IOPCIClassMatch</key>
 			<string>0x03000000&amp;0xff000000</string>
 			<key>IOPCIPrimaryMatch</key>
-			<string>0x12348086</string>
+			<string>0xff208086 0x9a498086 0xa7a08086</string>
 			<key>IOProbeScore</key>
 			<integer>80000</integer>
 			<key>IOProviderClass</key>
