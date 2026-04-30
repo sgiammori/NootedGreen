@@ -160,7 +160,8 @@ https://github.com/sgiammori/NootedGreen
 
 IOResources solving now is done like this for TGL kexts or IcL ketxts : first look at LE kexts and if any kexts is found than fallback to find in SLE kexts : * framebuffer for fb * + * graphics for gpu * + * bundle for metal *
 
-they (also Hookcase) need permissions fix so before move to /L/E do in some random folder, check below
+=> they need permissions fix (also Hookcase) so before move to /L/E do in some random folder, check below
+=> IOPCIPrimarymatch must be set in both *TGLGraphics* kexts in /Library/Extensiona
 ```
 
 ## Workflow for kexts (fb+Graphics+Hookcase in LE)
