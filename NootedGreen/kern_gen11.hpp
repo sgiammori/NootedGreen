@@ -1480,6 +1480,14 @@ private:
 	
 	static void hwSetPowerWellStatePG(void *that,bool param_1,uint param_2);
 	mach_vm_address_t ohwSetPowerWellStatePG {};
+
+	// V182: hwSetPowerWellStatePGE — enables PW_1/PW_2 (display power gates).
+	// Previously no-op'd via releaseDoorbell; now callthrough with 0x78=ccont
+	// fixup (same pattern as DDI/Aux). Linux confirms PW_1+PW_2 must be up
+	// before eDP AUX/PHY-A can be initialized. cold.1-.12 remain no-op to
+	// silence Apple's assert-on-timeout cold paths.
+	static void hwSetPowerWellStatePGE(void *that,bool param_1,uint param_2);
+	mach_vm_address_t ohwSetPowerWellStatePGE {};
 	
 	static void hwSetPowerWellStateDDI(void *that,bool param_1,uint param_2);
 	mach_vm_address_t ohwSetPowerWellStateDDI {};

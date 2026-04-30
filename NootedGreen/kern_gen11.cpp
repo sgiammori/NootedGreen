@@ -393,7 +393,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
 			// "err 2" on TGL kext because that symbol doesn't exist. TGL uses getOnlineInfo.
 			{"__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_", getOnlineInfo, this->ogetOnlineInfo},
-			{"__ZN19AppleIntelPowerWell21hwSetPowerWellStatePGEbj", releaseDoorbell},
+			// V182: callthrough with 0x78=ccont fixup; cold.1-.12 remain no-op (silence timeout panics)
+			{"__ZN19AppleIntelPowerWell21hwSetPowerWellStatePGEbj", hwSetPowerWellStatePGE, this->ohwSetPowerWellStatePGE},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateAuxEbj",hwSetPowerWellStateAux, this->ohwSetPowerWellStateAux},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateDDIEbj",hwSetPowerWellStateDDI, this->ohwSetPowerWellStateDDI},
 			{"__ZN31AppleIntelRegisterAccessManager19FastWriteRegister32Emj",FastWriteRegister32, this->oFastWriteRegister32},
@@ -5085,6 +5086,47 @@ void Gen11::hwSetPowerWellStatePG(void *that,bool param_1,uint param_2)
 	FunctionCast(hwSetPowerWellStatePG, callback->ohwSetPowerWellStatePG)(that,param_1,param_2);
 }
 
+// V182: Enable/disable display power gates PW_1 and PW_2 on RPL/ADL-P.
+// Linux i915 sequence: PW_1 → CDCLK → PW_2 → PW_A/B/C/D → eDP AUX.
+// The original Apple TGL code uses the same HSW_PWR_WELL_CTL2 (0x45404)
+// register and identical bit layout as ADL-P; it just needs that->0x78
+// pointing at the live controller (ccont) so ReadRegister32/WriteRegister32
+// route through our mapped MMIO rather than a stale pointer.
+void Gen11::hwSetPowerWellStatePGE(void *that,bool param_1,uint param_2)
+{
+	static int v182PgeCalls = 0;
+	v182PgeCalls++;
+	const bool v182Log = (v182PgeCalls <= 40);
+
+	uint32_t ctlBiosBefore = 0;
+	uint32_t ctl2Before = 0;
+	uint32_t pcodeBefore = 0;
+	if (v182Log) {
+		ctlBiosBefore = NGreen::callback->readReg32(0x45400);
+		ctl2Before = NGreen::callback->readReg32(0x45404);
+		pcodeBefore = NGreen::callback->readReg32(0x42000);
+		SYSLOG("ngreen", "V182.PGE[%d].enter: pw=%p en=%u mask=0x%x ctlBios=0x%x ctl2=0x%x pcode=0x%x",
+		       v182PgeCalls, that, param_1 ? 1 : 0, param_2,
+		       ctlBiosBefore, ctl2Before, pcodeBefore);
+	}
+
+	getMember<void *>(that, 0x78) = ccont;
+	if (!callback->ohwSetPowerWellStatePGE) {
+		SYSLOG("ngreen", "V182.PGE: original symbol missing, skipping callthrough");
+		return;
+	}
+	FunctionCast(hwSetPowerWellStatePGE, callback->ohwSetPowerWellStatePGE)(that,param_1,param_2);
+
+	if (v182Log) {
+		uint32_t ctlBiosAfter = NGreen::callback->readReg32(0x45400);
+		uint32_t ctl2After = NGreen::callback->readReg32(0x45404);
+		uint32_t pcodeAfter = NGreen::callback->readReg32(0x42000);
+		SYSLOG("ngreen", "V182.PGE[%d].exit:  pw=%p en=%u mask=0x%x ctlBios=0x%x->0x%x ctl2=0x%x->0x%x pcode=0x%x->0x%x",
+		       v182PgeCalls, that, param_1 ? 1 : 0, param_2,
+		       ctlBiosBefore, ctlBiosAfter, ctl2Before, ctl2After, pcodeBefore, pcodeAfter);
+	}
+}
+
 void Gen11::hwSetPowerWellStateDDI(void *that,bool param_1,uint param_2)
 {
 	getMember<void *>(that, 0x78) = ccont;
@@ -5929,7 +5971,13 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 	const bool skipOriginal = checkKernelArgument("-ngreenV69SkipOriginal");
 	uint64_t gpuBufBase = mappedBufPtr ? getMember<uint64_t>(mappedBufPtr, 0x18) : 0;
 	uint64_t gpuBufSize = mappedBufPtr ? getMember<uint64_t>(mappedBufPtr, 0x20) : 0;
-	bool safeForOriginal = mappedBufPtr && gpuBufBase != 0 && gpuBufSize >= 0xD040;
+	// V181: blit3d_initialize_scratch_space is now a no-op on !isRealTGL (the only step
+	// in initialize() that caused a write fault). With that intercepted, the original
+	// initialize() is safe to call — it will zero the header fields, skip the scratch write
+	// (our hook), and call blit3d_init_ctx, which is what enables getBlit2DContext.
+	// GPU VA is at mappedBuf[0x38], size at [0x20]. [0x18] is the task pointer, not GPU VA.
+	uint64_t gpuVA   = mappedBufPtr ? getMember<uint64_t>(mappedBufPtr, 0x38) : 0;
+	bool safeForOriginal = mappedBufPtr && gpuVA != 0 && gpuBufSize >= 0xD040;
 	const bool shouldTryOriginal = allowOriginal && !skipOriginal && safeForOriginal;
 	if (shouldTryOriginal) {
 		SYSLOG("ngreen", "V111B: calling original Blit3D init (opt-in, fullMTL=%d allow=%d skip=%d base=0x%llx size=0x%llx)",
@@ -6162,7 +6210,14 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 
 void Gen11::blit3d_initialize_scratch_space(void *that)
 {
-	// V128 rollback: allow original scratch init on spoofed paths.
+	// V181: On !isRealTGL the scratch buffer's CPU mapping (returned by getMemory()) is
+	// read-only — writing 0x44 bytes of TGL shader kernels to buf+0xD000 causes a write
+	// page fault (error code 0x2, CR2=buf+0xD000). Skip entirely on spoofed paths.
+	// The original initialize() is now safe to call because this is the only crashing step.
+	if (!NGreen::callback->isRealTGL) {
+		DBGLOG("ngreen", "V181: blit3d_initialize_scratch_space suppressed on RPL");
+		return;
+	}
 	FunctionCast(blit3d_initialize_scratch_space, callback->oblit3d_initialize_scratch_space)(that);
 }
 
