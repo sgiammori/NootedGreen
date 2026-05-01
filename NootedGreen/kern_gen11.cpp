@@ -81,7 +81,14 @@ static bool isExperimentalMonitorEnabled() {
 	return checkKernelArgument("-ngreenexp");
 }
 
+static bool isLegacyOwnershipModeEnabled();
+
 static bool isDisplayPipeForceDisabled() {
+	if (isLegacyOwnershipModeEnabled()) {
+		SYSLOG("ngreen", "V78A: legacy ownership mode forcing DisplayPipeSupported=0");
+		return true;
+	}
+
 	// Stage-3 baseline now has DYLD-side NULL guards for DisplayPipe path.
 	// Keep native DisplayPipe ON by default and use ngreendp0 only as an explicit
 	// fallback switch when troubleshooting.
@@ -178,6 +185,33 @@ static bool isV88ScanoutFillEnabled() {
 	}
 
 	return checkKernelArgument("-ngreenv88");
+}
+
+static bool isV60AggressiveMonitorEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenv60rw", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenv60rw");
+}
+
+static bool isLegacyOwnershipModeEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenlegacyown", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenlegacyown");
+}
+
+static bool isV74EnforcerEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenv74", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenv74");
 }
 
 static int getV77KillDelayIterations() {
@@ -2359,14 +2393,22 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	}
 	*/
 
-	// 5. V60: ACTIVE error suppression (V57 proven approach)
-	//    Clear ERROR_GEN6 by writing 0x0, re-mask EMR every cycle
-	if (realErr) {
-		NGreen::callback->writeReg32(ERROR_GEN6, 0x0);
+	const bool v60Aggressive = isV60AggressiveMonitorEnabled();
+	if (v60Count == 1) {
+		SYSLOG("ngreen", "V60: monitor mode=%s (enable -ngreenv60rw for active register writes)",
+			   v60Aggressive ? "aggressive" : "read-only");
 	}
-	// Re-mask EMR every cycle — Apple may unmask during error recovery attempts
-	if (emr != 0xFFFFFFFF) {
-		NGreen::callback->writeReg32(RING_EMR(RENDER_RING_BASE), 0xFFFFFFFF);
+
+	// 5. V60: error suppression path. Default is read-only for stability.
+	// Use -ngreenv60rw to enable active register writes during monitor ticks.
+	if (v60Aggressive) {
+		if (realErr) {
+			NGreen::callback->writeReg32(ERROR_GEN6, 0x0);
+		}
+		// Re-mask EMR every cycle — Apple may unmask during error recovery attempts
+		if (emr != 0xFFFFFFFF) {
+			NGreen::callback->writeReg32(RING_EMR(RENDER_RING_BASE), 0xFFFFFFFF);
+		}
 	}
 	
 	// 6. Log with ring + CSB focus
@@ -2431,12 +2473,15 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 				}
 				
 				// V68: Clear sched error EARLY (don't wait for iteration 5)
+				// This mutates live scheduler memory; keep disabled in read-only mode.
 				uint32_t schedErr = *reinterpret_cast<uint32_t *>(schedBase + 0x0C);
-				if (schedErr) {
+				if (schedErr && v60Aggressive) {
 					*reinterpret_cast<uint32_t *>(schedBase + 0x0C) = 0;
 					*reinterpret_cast<uint32_t *>(schedBase + 0x00) = 0;
 					SYSLOG("ngreen", "V68: early sched clear err=0x%x->0x%x flag=0x0",
 						schedErr, *reinterpret_cast<uint32_t *>(schedBase + 0x0C));
+				} else if (schedErr) {
+					SYSLOG("ngreen", "V68: sched err=0x%x observed (read-only mode, not clearing)", schedErr);
 				}
 			} else {
 				SYSLOG("ngreen", "V67: scheduler ptr is NULL!");
@@ -2553,13 +2598,15 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		uint32_t writeIdx = (csbPtrNow >> 8) & 0x7;
 		uint32_t readIdx  = csbPtrNow & 0x7;
 		SYSLOG("ngreen", "V64: CSB ptr=0x%x write=%d read=%d", csbPtrNow, writeIdx, readIdx);
-		if (writeIdx != readIdx) {
+		if (writeIdx != readIdx && v60Aggressive) {
 			// Advance read pointer to match write pointer
 			uint32_t newPtr = (csbPtrNow & ~0x7) | (writeIdx & 0x7);
 			NGreen::callback->writeReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE), newPtr);
 			uint32_t verify = NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
 			SYSLOG("ngreen", "V64: CSB read ptr advanced %d->%d (wrote 0x%x, readback 0x%x)",
 				   readIdx, writeIdx, newPtr, verify);
+		} else if (writeIdx != readIdx) {
+			SYSLOG("ngreen", "V64: read-only mode (use -ngreenv60rw to advance CSB read ptr)");
 		} else {
 			SYSLOG("ngreen", "V64: CSB ptrs already matched (write=read=%d)", writeIdx);
 		}
@@ -2568,7 +2615,7 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	// V65: Enforce RCS0 interrupt enable on EVERY iteration (moved from V64 iteration 5).
 	// V64 proved the fix at T+10s was too late — scheduler already gave up.
 	// Now combined with V65 pre-start + V65W watchdog fixes for full coverage.
-	{
+	if (v60Aggressive) {
 		uint32_t rcIntrEn = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
 		uint32_t rcsMask  = NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK);
 		
@@ -2593,34 +2640,10 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 	
-	// ── V79: Plane monitor / experimental linearization ──
-	// The old copy only reached brief first-light when the experimental path forced
-	// the scanout plane to linear and re-armed PLANE_SURF. Keep the default path
-	// read-only; restore the old behavior only with -ngreenexp.
-	if (isExperimentalMonitorEnabled()) {
-		if (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30) {
-			uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
-			uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
-			uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
-			if (tiling != 0) {
-				uint32_t newCtl = planCtl & ~(0x7u << 10); // clear tiling -> linear
-				uint32_t newStrd = planStrd;
-				if (tiling == 1) {
-					newStrd = planStrd * 8;
-				} else if (tiling == 4) {
-					newStrd = planStrd * 16;
-				}
-				NGreen::callback->writeReg32(0x70180, newCtl);
-				NGreen::callback->writeReg32(0x70188, newStrd);
-				uint32_t planSurf = NGreen::callback->readReg32(0x7019C);
-				NGreen::callback->writeReg32(0x7019C, planSurf);
-				SYSLOG("ngreen", "V79[%d]: tiling %d->linear CTL 0x%x->0x%x STRIDE 0x%x->0x%x SURF=0x%x",
-					   v60Count, tiling, planCtl, newCtl, planStrd, newStrd, planSurf);
-			} else {
-				SYSLOG("ngreen", "V79[%d]: already linear CTL=0x%x STRIDE=0x%x", v60Count, planCtl, planStrd);
-			}
-		}
-	} else {
+	// ── V79: Plane monitor (strictly read-only) ──
+	// Any plane-format writes here have caused either WS crash loops or WS hangs.
+	// Keep this path logging-only; never modify PLANE_CTL/STRIDE/SURF in V60.
+	{
 		uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
 		uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
 		uint32_t planSurf = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
@@ -2628,6 +2651,8 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		uint32_t planPos  = NGreen::callback->readReg32(0x7018C); // PLANE_POS
 		uint32_t pipeConf = NGreen::callback->readReg32(0x70008); // PIPE_CONF_A
 		uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
+
+		// Always log plane state for diagnostics
 		SYSLOG("ngreen", "V79[%d]: PIPE=0x%x CTL=0x%x STRIDE=0x%x SURF=0x%x SIZE=0x%x POS=0x%x tiling=%d",
 			   v60Count, pipeConf, planCtl, planStrd, planSurf, planSize, planPos, tiling);
 	}
@@ -2719,16 +2744,25 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		SYSLOG("ngreen", "V76[%d]: PSR_CTL=0x%x PSR_STATUS=0x%x PSR2_CTL=0x%x",
 			   v60Count, psrCtl, psrSts, psrCtl2);
 
-		// 5. Gamma LUT sample — if gamma table is zeroed, all output = black
-		// Read PREC_PAL_INDEX_A, set index, read data
+		// 5. Gamma LUT sample — if gamma table is zeroed, all output = black.
+		// In read-only mode keep current index untouched and only sample current entry.
 		uint32_t gammaIdx = NGreen::callback->readReg32(0x4A400); // PREC_PAL_INDEX_A
-		NGreen::callback->writeReg32(0x4A400, 0);                 // Set index to 0
-		uint32_t gamma0 = NGreen::callback->readReg32(0x4A404);   // PREC_PAL_DATA_A
-		NGreen::callback->writeReg32(0x4A400, 128);                // Mid-range index
-		uint32_t gamma128 = NGreen::callback->readReg32(0x4A404);
-		NGreen::callback->writeReg32(0x4A400, 255);                // Near max index
-		uint32_t gamma255 = NGreen::callback->readReg32(0x4A404);
-		NGreen::callback->writeReg32(0x4A400, gammaIdx);           // Restore original index
+		uint32_t gamma0 = 0;
+		uint32_t gamma128 = 0;
+		uint32_t gamma255 = 0;
+		if (v60Aggressive) {
+			NGreen::callback->writeReg32(0x4A400, 0);                 // Set index to 0
+			gamma0 = NGreen::callback->readReg32(0x4A404);            // PREC_PAL_DATA_A
+			NGreen::callback->writeReg32(0x4A400, 128);               // Mid-range index
+			gamma128 = NGreen::callback->readReg32(0x4A404);
+			NGreen::callback->writeReg32(0x4A400, 255);               // Near max index
+			gamma255 = NGreen::callback->readReg32(0x4A404);
+			NGreen::callback->writeReg32(0x4A400, gammaIdx);          // Restore original index
+		} else {
+			gamma0 = NGreen::callback->readReg32(0x4A404);
+			gamma128 = gamma0;
+			gamma255 = gamma0;
+		}
 		SYSLOG("ngreen", "V76[%d]: GAMMA idx_was=0x%x g[0]=0x%x g[128]=0x%x g[255]=0x%x",
 			   v60Count, gammaIdx, gamma0, gamma128, gamma255);
 
@@ -3011,10 +3045,39 @@ void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param
 			   v71Count, emrRcs, emrBcs, err);
 	}
 
-	// Display-state forcing experiments (V80/V88/V89/V90) are disabled.
-	// They were useful for isolation while the system booted in headless mode,
-	// but now that OpenCore injects the framebuffer ID early, let the native
-	// Apple display pipeline own plane/scaler/cursor/PSR state.
+	// V80 legacy ownership mode: keep plane linearization in the 50ms enforcer.
+	// This mirrors the old no-KP path where DisplayPipe was disabled and the plane
+	// format was continuously rewritten away from Apple's tiled compositor format.
+	if (!NGreen::callback->isRealTGL && isLegacyOwnershipModeEnabled()) {
+		uint32_t planCtl = NGreen::callback->readReg32(0x70180); // PLANE_CTL
+		bool planeEnabled = !!(planCtl & 0x80000000u);
+		if (planeEnabled) {
+			uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
+			uint32_t planSurf = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
+			uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
+			if (planSurf != 0 && tiling != 0) {
+				uint32_t newCtl = planCtl & ~(0x7u << 10); // clear tiling -> linear
+				uint32_t newStrd = planStrd;
+				if (tiling == 1) {
+					newStrd = planStrd * 8;
+				} else if (tiling == 4) {
+					newStrd = planStrd * 16;
+				}
+				NGreen::callback->writeReg32(0x70180, newCtl);
+				NGreen::callback->writeReg32(0x70188, newStrd);
+				NGreen::callback->writeReg32(0x7019C, planSurf);
+				if (v71Count <= 20 || (v71Count % 20) == 0) {
+					SYSLOG("ngreen", "V80L[%d]: tiling %u->linear CTL 0x%x->0x%x STRIDE 0x%x->0x%x SURF=0x%x",
+						   v71Count, tiling, planCtl, newCtl, planStrd, newStrd, planSurf);
+				}
+			} else if (planSurf != 0) {
+				NGreen::callback->writeReg32(0x7019C, planSurf);
+				if (v71Count <= 20 || (v71Count % 20) == 0) {
+					SYSLOG("ngreen", "V80L[%d]: already linear, SURF re-arm=0x%x", v71Count, planSurf);
+				}
+			}
+		}
+	}
 
 	// V116: Re-enforce GGTT[0] → safe dummy page every 50ms.
 	// Apple's driver may re-write GGTT[0] → stolen mem base, causing package-wide MCE.
@@ -3137,7 +3200,6 @@ void Gen11::v54IrqWatchdog(thread_call_param_t param0, thread_call_param_t) {
 		SYSLOG("ngreen", "V54W: watchdog complete after %d iterations", v54WatchdogCount);
 	}
 }
-
 // V44: Bundle/property logging disabled — commented out to reduce boot-time overhead.
 #if 0
 static const char *v44SafeCString(OSString *str) {
@@ -3807,12 +3869,12 @@ bool Gen11::start(void *that,void  *param_1)
 			SYSLOG("ngreen", "V59: scheduled delayed child checks at T+3,10,15,20,30,60,120s");
 
 			// V74: Start PERMANENT EMR enforcer — 50ms interval, runs forever.
-			// Retain the IOService so it stays alive while a timer is pending (UAF fix).
-			{
+			// Now opt-in via -ngreenv74 to isolate watchdog regressions.
+			if (isV74EnforcerEnabled()) {
 				auto *emrSvc = static_cast<IOService *>(that);
 				emrSvc->retain();
 				auto emrTimer = thread_call_allocate(v71EmrEnforcer,
-									 static_cast<thread_call_param_t>(emrSvc));
+								 static_cast<thread_call_param_t>(emrSvc));
 				if (emrTimer) {
 					uint64_t deadline;
 					clock_interval_to_deadline(50, kMillisecondScale, &deadline);
@@ -3821,6 +3883,8 @@ bool Gen11::start(void *that,void  *param_1)
 				} else {
 					emrSvc->release(); // alloc failed — drop our retain
 				}
+			} else {
+				SYSLOG("ngreen", "V74: EMR enforcer disabled (enable with -ngreenv74)");
 			}
 
 			// V60: GPU health monitor (contains V77 DisplayPipe terminator) — opt-in only.
