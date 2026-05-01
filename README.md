@@ -126,6 +126,11 @@ Recommended debug order for `ngreenV142` on spoofed RPL/ADL:
 2. `ngreenV142=2` (alternate bypass semantics)
 3. `ngreenV142=3` only for controlled repro (Apple original path)
 
+Sonoma 14.7.1 note: when WindowServer crashes with `EXC_BAD_ACCESS` at `0x80` in
+`CoreDisplay::DisplaySurface::AccessComplete()` / `std::__hash_table::find`, NootedGreen
+now applies a non-real-TGL-only DYLD guard (V187) that short-circuits `AccessComplete`
+to avoid the recycle loop. Real TGL behavior is unchanged.
+
 ## Hookcase
 
 Hookcase (change `AppleInteePortHal` and `AppleIntelPortHal` implementation):

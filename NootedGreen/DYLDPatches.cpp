@@ -193,6 +193,26 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 		0x84,0xc0                             // (keep: test al,al)
 	};
 
+	// V187: CoreDisplay::DisplaySurface::AccessComplete crash guard (Sonoma 14.7.1).
+	// Current WindowServer recycle loop crashes at:
+	//   std::__hash_table<...>::find + 0x4
+	//   CoreDisplay::DisplaySurface::AccessComplete + 1928
+	// with KERN_INVALID_ADDRESS at 0x80 on spoofed RPL/ADL.
+	// Short-circuit AccessComplete to avoid dereferencing invalid internal state.
+	// Preserve real TGL behavior by applying only on !isRealTGL.
+	static const uint8_t f_accesscomplete_guard_sonoma[] = {
+		0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,
+		0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,
+		0xd8,0x01,0x00,0x00,0x48,0x8b,0x05,0xc1,
+		0xaa,0x8f,0x3f,0x48,0x8b,0x00,0x48,0x89
+	};
+	static const uint8_t r_accesscomplete_guard_sonoma[] = {
+		0x31,0xc0,0xc3,0x90,0x90,0x90,0x90,0x90,
+		0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,
+		0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,
+		0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90
+	};
+
 	if (getKernelVersion() >= KernelVersion::Ventura) {
 		const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
 		const bool forceFullMTL = shouldForceFullMetalPath();
@@ -239,6 +259,11 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 				{f_isrm_guard_sonoma, r_isrm_guard_sonoma, "RunFullDisplayPipe isRemovable crash guard (Sonoma)"},
 			};
 			DYLDPatch::applyAll(isRemovableGuardPatch, const_cast<void *>(data), PAGE_SIZE);
+
+			const DYLDPatch accessCompleteGuardPatch[] = {
+				{f_accesscomplete_guard_sonoma, r_accesscomplete_guard_sonoma, "DisplaySurface::AccessComplete crash guard (Sonoma)"},
+			};
+			DYLDPatch::applyAll(accessCompleteGuardPatch, const_cast<void *>(data), PAGE_SIZE);
 		}
 	}
 }
