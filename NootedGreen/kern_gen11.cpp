@@ -3125,6 +3125,61 @@ void Gen11::v54IrqWatchdog(thread_call_param_t param0, thread_call_param_t) {
 	}
 }
 
+// V44: Bundle/property logging disabled — commented out to reduce boot-time overhead.
+// Uncomment to re-enable delayed bundle property diagnostics.
+#if 0
+static const char *v44SafeCString(OSString *str) {
+    if (!str) {
+        return "MISSING";
+    }
+    auto *cstr = str->getCStringNoCopy();
+    return cstr ? cstr : "<null-cstr>";
+}
+
+static void v44DelayedBundleLog(thread_call_param_t p0, thread_call_param_t p1) {
+    auto *svc = static_cast<IOService *>(p0);
+    unsigned delayMs = (unsigned)(uintptr_t)p1;
+
+    auto *metalProp = OSDynamicCast(OSString, svc->getProperty("MetalPluginName"));
+    auto *glProp    = OSDynamicCast(OSString, svc->getProperty("IOGLBundleName"));
+    auto *dvdProp   = OSDynamicCast(OSString, svc->getProperty("IODVDBundleName"));
+    auto *accelBid  = OSDynamicCast(OSString, svc->getProperty("AcceleratorBundleIdentifier"));
+    auto *fbBid     = OSDynamicCast(OSString, svc->getProperty("FramebufferBundleIdentifier"));
+    auto *vaRIDProp = OSDynamicCast(OSNumber, svc->getProperty("IOVARendererID"));
+
+    SYSLOG("ngreen", "V44: T+%ums MetalPlugin=%s GL=%s DVD=%s VARendID=0x%x",
+           delayMs,
+           v44SafeCString(metalProp),
+           v44SafeCString(glProp),
+           v44SafeCString(dvdProp),
+           vaRIDProp ? (uint32_t)vaRIDProp->unsigned32BitValue() : 0);
+    SYSLOG("ngreen", "V44: T+%ums AcceleratorBundleIdentifier=%s FramebufferBundleIdentifier=%s",
+           delayMs,
+           v44SafeCString(accelBid),
+           v44SafeCString(fbBid));
+
+    // Release retain acquired by scheduler helper.
+    svc->release();
+}
+
+static void v44ScheduleBundleLog(void *accelInstance, unsigned delayMs) {
+    auto *svc = static_cast<IOService *>(accelInstance);
+    svc->retain();
+
+    thread_call_t tc = thread_call_allocate(v44DelayedBundleLog,
+                                        static_cast<thread_call_param_t>(svc));
+    if (tc) {
+        uint64_t deadline;
+        clock_interval_to_deadline(delayMs, kMillisecondScale, &deadline);
+        thread_call_enter1_delayed(tc,
+                                   (thread_call_param_t)(uintptr_t)delayMs,
+                                   deadline);
+    } else {
+        svc->release();
+    }
+}
+#endif
+
 bool Gen11::start(void *that,void  *param_1)
 {
 	// V44: Configurable scheduler type.
@@ -3439,11 +3494,20 @@ bool Gen11::start(void *that,void  *param_1)
 		auto *accelSvc = static_cast<IOService *>(that);
 		auto *metalProp = OSDynamicCast(OSString, accelSvc->getProperty("MetalPluginName"));
 		auto *glProp    = OSDynamicCast(OSString, accelSvc->getProperty("IOGLBundleName"));
+		auto *dvdProp   = OSDynamicCast(OSString, accelSvc->getProperty("IODVDBundleName"));
 		auto *vaRIDProp = OSDynamicCast(OSNumber, accelSvc->getProperty("IOVARendererID"));
+		const char *metalStr = (metalProp && metalProp->getCStringNoCopy()) ? metalProp->getCStringNoCopy() : "MISSING";
+		const char *glStr = (glProp && glProp->getCStringNoCopy()) ? glProp->getCStringNoCopy() : "MISSING";
+		const char *dvdStr = (dvdProp && dvdProp->getCStringNoCopy()) ? dvdProp->getCStringNoCopy() : "MISSING";
 		SYSLOG("ngreen", "V44: MetalPlugin=%s GL=%s VARendID=0x%x",
-			   metalProp ? metalProp->getCStringNoCopy() : "MISSING",
-			   glProp ? glProp->getCStringNoCopy() : "MISSING",
+			   metalStr,
+			   glStr,
 			   vaRIDProp ? (uint32_t)vaRIDProp->unsigned32BitValue() : 0);
+		SYSLOG("ngreen", "V44: DVD=%s MTL_TGL=%d GL_TGL=%d VA_TGL=%d",
+			   dvdStr,
+			   !strcmp(metalStr, "AppleIntelTGLGraphicsMTLDriver"),
+			   !strcmp(glStr, "AppleIntelTGLGraphicsGLDriver"),
+			   !strcmp(dvdStr, "AppleIntelTGLGraphicsVADriver"));
 	}
 	
 	// Ring buffer state
