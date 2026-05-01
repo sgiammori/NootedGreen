@@ -181,28 +181,28 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			loggedMetalMode = true;
 		}
 
-		const DYLDPatch assertionPatch[] = {
-			{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-		};
-		DYLDPatch::applyAll(assertionPatch, const_cast<void *>(data), PAGE_SIZE);
-
-		// Always guard RunFullDisplayPipe against NULL DisplaySurface — can happen
-		// during startup even with full Metal path active.
-		const DYLDPatch fdpGuardPatch[] = {
-			{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma)"},
-		};
-		DYLDPatch::applyAll(fdpGuardPatch, const_cast<void *>(data), PAGE_SIZE);
-
-		if (!isRealTGL) {
-			// Keep full-MTL mode, but harden GetMTLTexture for spoofed CPUs to avoid
-			// ObjC aborts when CoreDisplay receives an invalid MetalDevice object.
-			const DYLDPatch getMtlTextureSafetyPatch[] = {
-				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
+		// All CoreDisplay patches are gated on forceFullMTL or isRealTGL.
+		// Without -ngreenfullmtldyld (or -ngreenfullmtl), Stage 1 is zero-DYLD for CoreDisplay.
+		if (isRealTGL || forceFullMTL) {
+			const DYLDPatch assertionPatch[] = {
+				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
 			};
-			DYLDPatch::applyAll(getMtlTextureSafetyPatch, const_cast<void *>(data), PAGE_SIZE);
+			DYLDPatch::applyAll(assertionPatch, const_cast<void *>(data), PAGE_SIZE);
 
-			if (!forceFullMTL) {
-				// Non-Metal path: also stub command queue acquisition.
+			const DYLDPatch fdpGuardPatch[] = {
+				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma)"},
+			};
+			DYLDPatch::applyAll(fdpGuardPatch, const_cast<void *>(data), PAGE_SIZE);
+
+			if (!isRealTGL && !forceFullMTL) {
+				// Non-Metal path: stub both Metal object accessors to NULL.
+				// Do NOT apply when forceFullMTL=true — CoreDisplay needs real
+				// Metal textures/command queues for the full compositor path.
+				const DYLDPatch getMtlTextureSafetyPatch[] = {
+					{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
+				};
+				DYLDPatch::applyAll(getMtlTextureSafetyPatch, const_cast<void *>(data), PAGE_SIZE);
+
 				const DYLDPatch getMtlCommandQueueSafetyPatch[] = {
 					{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma)"},
 				};
