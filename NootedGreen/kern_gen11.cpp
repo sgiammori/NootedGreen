@@ -205,13 +205,8 @@ static bool isLegacyOwnershipModeEnabled() {
 	return checkKernelArgument("-ngreenlegacyown");
 }
 
-static bool isV74EnforcerEnabled() {
-	int enabled = 0;
-	if (PE_parse_boot_argn("ngreenv74", &enabled, sizeof(enabled))) {
-		return enabled != 0;
-	}
-
-	return checkKernelArgument("-ngreenv74");
+static bool isV80LEnforcerEnabled() {
+	return checkKernelArgument("-ngreenv80l");
 }
 
 static int getV77KillDelayIterations() {
@@ -3045,10 +3040,14 @@ void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param
 			   v71Count, emrRcs, emrBcs, err);
 	}
 
-	// V80 legacy ownership mode: keep plane linearization in the 50ms enforcer.
-	// This mirrors the old no-KP path where DisplayPipe was disabled and the plane
-	// format was continuously rewritten away from Apple's tiled compositor format.
-	if (!NGreen::callback->isRealTGL && isLegacyOwnershipModeEnabled()) {
+	// V80 legacy ownership mode: one-shot plane linearization at early boot.
+	// Runs only during the first 3 ticks (≤150ms after start) — this produces the
+	// brief display flash that was present before the start hook was active.
+	// After tick 3 WS has composited its first frame and owns those registers;
+	// continuing to write them causes WS crash-loop → watchdog KP at T+120s.
+	// -ngreenv80l overrides to run continuously (for isolated plane-write testing only).
+	if (!NGreen::callback->isRealTGL && isLegacyOwnershipModeEnabled() &&
+	    (v71Count <= 3 || isV80LEnforcerEnabled())) {
 		uint32_t planCtl = NGreen::callback->readReg32(0x70180); // PLANE_CTL
 		bool planeEnabled = !!(planCtl & 0x80000000u);
 		if (planeEnabled) {
@@ -3869,8 +3868,9 @@ bool Gen11::start(void *that,void  *param_1)
 			SYSLOG("ngreen", "V59: scheduled delayed child checks at T+3,10,15,20,30,60,120s");
 
 			// V74: Start PERMANENT EMR enforcer — 50ms interval, runs forever.
-			// Now opt-in via -ngreenv74 to isolate watchdog regressions.
-			if (isV74EnforcerEnabled()) {
+			// Required: keeps EMR masked so Apple can't re-enable error interrupts.
+			// Without this the display pipe fails to activate entirely (all-black screen).
+			{
 				auto *emrSvc = static_cast<IOService *>(that);
 				emrSvc->retain();
 				auto emrTimer = thread_call_allocate(v71EmrEnforcer,
@@ -3883,8 +3883,6 @@ bool Gen11::start(void *that,void  *param_1)
 				} else {
 					emrSvc->release(); // alloc failed — drop our retain
 				}
-			} else {
-				SYSLOG("ngreen", "V74: EMR enforcer disabled (enable with -ngreenv74)");
 			}
 
 			// V60: GPU health monitor (contains V77 DisplayPipe terminator) — opt-in only.

@@ -24,9 +24,11 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 - **V88 scanout fill remains opt-in** (`-ngreenv88`). Default boots do not paint diagnostic bars over normal UI layout.
 - **GPU reset storm fully tamed (V157):** `resetGraphicsEngine` circuit-breaker (V153+V154) confirmed working — V153 fires from call #1 (coerces `ret=1025→0` when RCS ring head == tail), V154 opens at call #4 (skips original reset entirely after 3 consecutive quiescent coercions). Ring CTL is restored to `0x7001` (RING_ENABLE set) on every fake-success path via V155 saved-CTL restore.
 - **Execlist cleanup in progress (V158):** Root cause of remaining `userspace watchdog timeout` panics is identified — `EXEC=0x40018098` (execlist FIFO stalled, bit 30 set) and `CSB=0x1001` (15 unread context-status entries) persist post-fake-success, causing Apple's driver to keep scheduling resets. V158 addresses this by writing four null descriptors to `RING_ELSP` (cancelling pending EL0/EL1 contexts) and advancing the CSB read pointer to match the write pointer on every V153/V154 return-0 path.
+- **V80L root cause identified:** The `userspace watchdog timeout` KP (T+120s, 2 induced WS crashes) was traced to the V80L plane-linearization block inside `v71EmrEnforcer`. It was writing `PLANE_CTL` / `PLANE_STRIDE` / `PLANE_SURF` every 50ms while WindowServer was actively compositing those same registers — WS detected a render failure, crash-looped, and watchdogd fired. V80L is now limited to the first 3 enforcer ticks (≤150ms after `start()`), which preserves the visible brief display flash at early boot without fighting WS after it takes over the compositor. Use `-ngreenv80l` for continuous mode (testing only).
 
 ### Recent Progress
 
+- **V80L fix:** `userspace watchdog timeout` KP root cause confirmed and fixed. V80L (plane-linearization writes in `v71EmrEnforcer`) limited to first 3 ticks only. Brief display flash preserved; WS crash-loop eliminated. `-ngreenv80l` enables continuous mode for testing.
 - **V158:** Cancel pending execlist contexts + drain CSB after every fake-success `resetGraphicsEngine` return. Writes 4×0 to `RING_ELSP` (two null 64-bit context descriptors = cancel EL0 + EL1), then reads `RING_CONTEXT_STATUS_PTR` and writes back with read_ptr set to write_ptr. Logs `EXEC` value after the null writes to confirm whether execlist FIFO cleared. Applied on both V153 and V154 return-0 paths. Build confirmed clean. Boot test pending.
 - **V157:** Removed `rcsCtl == 0` guard from V153 quiescent check — hardware restores CTL to `0x7001` before V153 reads it, so the condition was always false. Only `rcsHead == rcsTail && err == 0` is needed. Boot log confirmed: V153 now fires from call #1.
 - **V156:** Fixed `RING_ENABLE` bit (ORed `| 1` at all CTL write sites). Dropped `bCtl == 0` from V154 check. Stabilized ring-enabled state across all fake-success paths.
@@ -67,7 +69,7 @@ Key registers (all offsets from `RENDER_RING_BASE = 0x2000`):
 
 ### Current Status
 
-System boots to login on RPL macOS 14.7.1 (`23H222`). The GPU reset storm is tamed: V153+V154 prevent the health monitor from burning the watchdog budget on redundant reset calls. CTL is stable at `0x7001`. Active investigation targets execlist/CSB cleanup (V158) to let Apple's driver recognize the engine as truly idle after each fake-success return. V88 visual fill is opt-in only (`-ngreenv88`) so default boots preserve normal Apple UI layout.
+System boots to login on RPL macOS 14.7.1 (`23H222`). The GPU reset storm is tamed: V153+V154 prevent the health monitor from burning the watchdog budget on redundant reset calls. CTL is stable at `0x7001`. The `userspace watchdog timeout` KP root cause has been identified and fixed: V80L plane-linearization writes in `v71EmrEnforcer` were fighting WindowServer over `PLANE_CTL`/`PLANE_STRIDE`/`PLANE_SURF` every 50ms — this has been corrected (first 3 ticks only). Active investigation continues on execlist/CSB cleanup (V158). V88 visual fill is opt-in only (`-ngreenv88`) so default boots preserve normal Apple UI layout.
 
 ## Requirements
 
@@ -114,6 +116,8 @@ These properties are essential for correct platform identification and WEG coexi
 | `-ngreenRefProbeF2` / `ngreenRefProbeF2=1` | Enable reference f2 osinfo patch probe on non-real TGL (diagnostic only) |
 | `-ngreenV69AllowOriginal` | Opt in to Apple's original Blit3D initialize on non-real TGL when safety preconditions are met. **High risk / diagnostic only**; can panic on unsupported setups. |
 | `-ngreenV69SkipOriginal` | Hard-disable Apple's original Blit3D initialize on non-real TGL, even if `-ngreenV69AllowOriginal` is present. |
+| `-ngreenlegacyown` / `ngreenlegacyown=1` | Legacy display ownership mode — forces `DisplayPipeSupported=0` and enables early-boot V80L plane linearization. Useful for testing the pre-compositor display pipe path. |
+| `-ngreenv80l` / `ngreenv80l=1` | Run V80L plane-linearization writes continuously (every 50ms) instead of the default first-3-ticks-only behavior. **Testing only** — causes WS crash-loop + watchdog KP on normal boots. |
 | `ngreenLanes=1|2|4` | Override lane count used by non-real TGL computeLaneCount bypass (default 2 lanes) |
 | `-ngreenforceprops` / `ngreenforceprops=1` | Enable legacy forced IGPU property injection (`AAPL,ig-platform-id`, `model`, `saved-config`, etc.). Disabled by default in compatibility-first mode. |
 | `IGLogLevel=8` | Maximum Intel GPU driver logging |
@@ -295,7 +299,7 @@ NootedGreen (Gen11/Gen12 — TGL driver spoofing):
 | Platform | Status | Est. | Notes |
 |----------|--------|------|-------|
 | **Tiger Lake** | ~90% | V52 | RPL-specific patches auto-skipped via CPUID. GuC, topology, ForceWake, BCS all use native Apple paths. Remaining risk: SKU bypass hook + DYLD patches still in the path. No real TGL hardware tested yet. |
-| **Raptor Lake-P** | ~65% | V158 | Primary dev platform (i7-13700H). System boots to login on macOS 14.7.1 (`23H222`). GPU reset storm tamed: V153/V154 circuit-breaker confirmed working (V153 fires call #1, V154 opens call #4), CTL stable at `0x7001`. Active fix: V158 clears execlist/CSB to stop Apple's driver seeing stale pending-context state post-fake-success. `userspace watchdog timeout` panic still under investigation. |
+| **Raptor Lake-P** | ~70% | V80L | Primary dev platform (i7-13700H). System boots to login on macOS 14.7.1 (`23H222`). GPU reset storm tamed: V153/V154 circuit-breaker confirmed working. `userspace watchdog timeout` KP root cause identified and fixed: V80L plane-linearization in `v71EmrEnforcer` was fighting WindowServer over plane registers every 50ms — now limited to first 3 ticks. Brief display flash at boot preserved. Active work: V158 execlist/CSB drain. |
 | **Alder Lake** | ~35% | — | Same Gen12 arch as RPL, should behave similarly. Untested. |
 | **Rocket Lake** | ~25% | — | Gen12 LP but different display engine. Untested. |
 | **Ice Lake** | ~50% | V52 | Dedicated ICL path exists (ICL FB + ICL HW kextInfos, ICL-specific object offsets in `getGPUInfoICL`, SKU gate×3, platform remap, PAVP hook, DYLD ICL Metal device-ID bypass). Topology hardcoded to ICL GT2 LP (1×8×8=64EU). IRQ init disabled (V37 boot hang). ICL path only activates when TGL kexts are absent. Untested on real ICL hardware. |
