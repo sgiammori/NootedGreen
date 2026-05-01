@@ -5404,34 +5404,50 @@ uint8_t Gen11::hwRegsNeedUpdate
 void Gen11::computeLaneCount(void *that, const void *timing, unsigned int linkRate, unsigned int bpp, unsigned int *laneCount) {
 	if (!laneCount) return;
 
-	if (!NGreen::callback->isRealTGL) {
-		// V90L4: Apple's TGL computeLaneCount only handles standard DP rates (6/10/20/30).
-		// RPL-P VBT/panel uses rate=24 (24×270=6480 Mbps custom eDP rate) — Apple returns 0.
-		// Skip the original entirely for spoofed paths: default to 2 lanes (most common
-		// eDP configuration). Override via boot-arg "ngreenLanes=4" for 4-lane panels.
-		unsigned int lanes = 2;
-		int lanesArg = 0;
-		if (PE_parse_boot_argn("ngreenLanes", &lanesArg, sizeof(lanesArg)) &&
-		    (lanesArg == 1 || lanesArg == 2 || lanesArg == 4))
-			lanes = static_cast<unsigned int>(lanesArg);
-		*laneCount = lanes;
+	// Always try Apple's original first — it handles all standard DP rates correctly
+	// on both real TGL and spoofed paths.
+	FunctionCast(computeLaneCount, callback->ocomputeLaneCount)(that, timing, linkRate, bpp, laneCount);
 
+	if (*laneCount != 0) {
+		// Apple computed a valid result; use it unmodified.
 		static int v90L4Logs = 0;
-		if (v90L4Logs < 20) {
+		if (v90L4Logs < 5) {
 			v90L4Logs++;
-			SYSLOG("ngreen", "V90L4[%d]: linkRate=%u bpp=%u laneCount=%u (bypassed Apple)",
+			SYSLOG("ngreen", "V90L4[%d]: linkRate=%u bpp=%u laneCount=%u (Apple OK)",
 			       v90L4Logs, linkRate, bpp, *laneCount);
 		}
 		return;
 	}
 
-	// Real TGL: use Apple's original implementation unmodified
-	FunctionCast(computeLaneCount, callback->ocomputeLaneCount)(that, timing, linkRate, bpp, laneCount);
-	static int v90L4RLogs = 0;
-	if (v90L4RLogs < 5) {
-		v90L4RLogs++;
-		SYSLOG("ngreen", "V90L4R[%d]: realTGL linkRate=%u bpp=%u laneCount=%u",
-		       v90L4RLogs, linkRate, bpp, *laneCount);
+	// Apple returned 0: non-standard link rate (e.g. rate=24 → 6480 Mbps eDP) that
+	// Apple's switch-table doesn't cover.  Compute the minimum lane count from the
+	// timing data rather than hardcoding a guess.
+	//
+	//   linkRate unit: 270 Mbps per step  (6=RBR, 10=HBR, 20=HBR2, 24=custom, 30=HBR3)
+	//   8b/10b encoding overhead: effective bandwidth = linkRate × 270 Mbps × 0.8
+	//   Required bandwidth: pixelClock (Hz) × bpp (bits)
+	//   min_lanes = ceil(pixelClock × bpp / (linkRate × 270,000,000 × 0.8))
+	//   Round up to nearest valid DP lane count {1, 2, 4}.
+	unsigned int computed = 1;
+	if (timing != nullptr && linkRate > 0 && bpp > 0) {
+		const auto *t = static_cast<const IODetailedTimingInformationV2 *>(timing);
+		// perLane: effective bps per lane with 8b/10b overhead
+		const uint64_t perLane = static_cast<uint64_t>(linkRate) * 270000000ULL * 8 / 10;
+		const uint64_t needed  = t->pixelClock * bpp;
+		const unsigned int minLanes = static_cast<unsigned int>((needed + perLane - 1) / perLane);
+		computed = (minLanes > 2) ? 4u : (minLanes > 1) ? 2u : 1u;
+	} else {
+		// No timing info — fall back to 2 as the most common eDP configuration,
+		// but only as a last resort when we have nothing to compute from.
+		computed = 2;
+	}
+	*laneCount = computed;
+
+	static int v90L4FLogs = 0;
+	if (v90L4FLogs < 20) {
+		v90L4FLogs++;
+		SYSLOG("ngreen", "V90L4[%d]: linkRate=%u bpp=%u laneCount=%u (computed from timing)",
+		       v90L4FLogs, linkRate, bpp, *laneCount);
 	}
 }
 
