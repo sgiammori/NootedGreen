@@ -132,10 +132,16 @@ static bool isReferenceF2ProbeEnabled() {
 
 static bool shouldForceFullMetalPath() {
 	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenfullmtlcore", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+	if (checkKernelArgument("-ngreenfullmtlcore")) {
+		return true;
+	}
+	// Legacy: unified arg still accepted as fallback.
 	if (PE_parse_boot_argn("ngreenfullmtl", &enabled, sizeof(enabled))) {
 		return enabled != 0;
 	}
-
 	return checkKernelArgument("-ngreenfullmtl");
 }
 

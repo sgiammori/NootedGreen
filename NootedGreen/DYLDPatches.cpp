@@ -12,10 +12,16 @@ void DYLDPatches::init() { callback = this; }
 
 static bool shouldForceFullMetalPath() {
 	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenfullmtldyld", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+	if (checkKernelArgument("-ngreenfullmtldyld")) {
+		return true;
+	}
+	// Legacy: unified arg still accepted as fallback.
 	if (PE_parse_boot_argn("ngreenfullmtl", &enabled, sizeof(enabled))) {
 		return enabled != 0;
 	}
-
 	return checkKernelArgument("-ngreenfullmtl");
 }
 
