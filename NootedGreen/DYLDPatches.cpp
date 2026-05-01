@@ -187,13 +187,21 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 		};
 		DYLDPatch::applyAll(fdpGuardPatch, const_cast<void *>(data), PAGE_SIZE);
 
-		if (!isRealTGL && !forceFullMTL) {
-			// Non-Metal path: stub out Metal calls so they return NULL safely.
-			const DYLDPatch safetyPatches[] = {
+		if (!isRealTGL) {
+			// Keep full-MTL mode, but harden GetMTLTexture for spoofed CPUs to avoid
+			// ObjC aborts when CoreDisplay receives an invalid MetalDevice object.
+			const DYLDPatch getMtlTextureSafetyPatch[] = {
 				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
-				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma)"},
 			};
-			DYLDPatch::applyAll(safetyPatches, const_cast<void *>(data), PAGE_SIZE);
+			DYLDPatch::applyAll(getMtlTextureSafetyPatch, const_cast<void *>(data), PAGE_SIZE);
+
+			if (!forceFullMTL) {
+				// Non-Metal path: also stub command queue acquisition.
+				const DYLDPatch getMtlCommandQueueSafetyPatch[] = {
+					{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma)"},
+				};
+				DYLDPatch::applyAll(getMtlCommandQueueSafetyPatch, const_cast<void *>(data), PAGE_SIZE);
+			}
 		}
 	}
 }
