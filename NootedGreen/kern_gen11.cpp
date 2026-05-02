@@ -203,6 +203,15 @@ static int getV142SubmitBlitMode() {
 }
 
 static bool isUnsafeV142OrigAllowedOnSpoof() {
+	int parsed = 0;
+	if (PE_parse_boot_argn("ngreenV142", &parsed, sizeof(parsed))) {
+		return parsed == 3;
+	}
+
+	if (checkKernelArgument("-ngreenV142orig")) {
+		return true;
+	}
+
 	int enabled = 0;
 	if (PE_parse_boot_argn("ngreenV142forceorig", &enabled, sizeof(enabled))) {
 		return enabled != 0;
@@ -2449,13 +2458,12 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 		
 		// ── V79: Plane linearization (brief Apple logo flash) — aggressive mode only ──
-		// COMMENTED OUT FOR ROLLBACK INVESTIGATION: V79 plane-write restoration disabled
-		// to identify if the flash behavior regression is tied to V79 writes.
-		// Original cadence: iterations <=5, 10, 20, 30 (from 16329f9).
-		
-		// Convert plane from tiled to linear format on first 5 iterations.
-		// This causes the brief visible flash of the Apple boot logo before WS takes over.
-		if (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30) {
+		// Boot log shows SURF=0x0 for iters 1–6; SURF becomes non-zero (tiled) at iter 7 (~14s).
+		// Old cadence (<=5, 10, 20, 30) skipped iter 7/8/9 — the first 6s window where the plane
+		// is tiled. Writing at iter 10 (~20s) is too late: the login screen is already up and the
+		// Apple logo phase has ended. Fix: fire every tick from 1–12 so we catch iter 7 immediately
+		// (first time SURF is mapped and tiling != 0) while the Apple logo may still be on screen.
+		if (v60Count <= 12 || v60Count == 20 || v60Count == 30) {
 			uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
 			uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
 			uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
@@ -3874,7 +3882,7 @@ bool Gen11::start(void *that,void  *param_1)
 		SYSLOG("ngreen", "V45: properties present: MetalPlugin=%d GL=%d CFPlugIn=%d VARend=%d",
 			   hasMetal, hasGL, hasCFPI, hasVARID);
 			   
-		v44ScheduleBundleLog(that, 500); // TEST
+		//v44ScheduleBundleLog(that, 500);
 
 		// 5. If MetalPluginName is missing, set GPU properties directly on the service
 		//    (normally they come from the matched personality, but if IOKit didn't merge them...)
