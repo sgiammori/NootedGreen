@@ -236,16 +236,18 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	if (getKernelVersion() >= KernelVersion::Ventura) {
 		const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
 		const bool forceFullMTL = shouldForceFullMetalPath();
+		const bool applyCoreDisplaySafety = isRealTGL || forceFullMTL || !isRealTGL;
 		static bool loggedMetalMode = false;
 		if (!loggedMetalMode) {
 			const bool fullMTLActive = isRealTGL || forceFullMTL;
-			SYSLOG("DYLD", "FULL_MTL_ACTIVE=%d (isRealTGL=%d forceFullMTL=%d)", fullMTLActive, isRealTGL, forceFullMTL);
+			SYSLOG("DYLD", "FULL_MTL_ACTIVE=%d CORE_SAFETY_ACTIVE=%d (isRealTGL=%d forceFullMTL=%d)",
+			       fullMTLActive, applyCoreDisplaySafety, isRealTGL, forceFullMTL);
 			loggedMetalMode = true;
 		}
 
-		// All CoreDisplay patches are gated on forceFullMTL or isRealTGL.
-		// Without -ngreenfullmtldyld (or -ngreenfullmtl), Stage 1 is zero-DYLD for CoreDisplay.
-		if (isRealTGL || forceFullMTL) {
+		// Keep these safety guards enabled on spoofed hardware even without full-MTL args,
+		// otherwise WindowServer/cursor init can regress before fallback stubs engage.
+		if (applyCoreDisplaySafety) {
 			const DYLDPatch assertionPatch[] = {
 				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
 			};

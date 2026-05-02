@@ -2447,36 +2447,6 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		if (emr != 0xFFFFFFFF) {
 			NGreen::callback->writeReg32(RING_EMR(RENDER_RING_BASE), 0xFFFFFFFF);
 		}
-		
-		// ── V79: Plane linearization (brief Apple logo flash) — aggressive mode only ──
-		// COMMENTED OUT FOR ROLLBACK INVESTIGATION: V79 plane-write restoration disabled
-		// to identify if the flash behavior regression is tied to V79 writes.
-		// Original cadence: iterations <=5, 10, 20, 30 (from 16329f9).
-		
-		// Convert plane from tiled to linear format on first 5 iterations.
-		// This causes the brief visible flash of the Apple boot logo before WS takes over.
-		if (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30) {
-			uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
-			uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
-			uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
-			if (tiling != 0) {
-				uint32_t newCtl = planCtl & ~(0x7u << 10); // clear tiling -> linear
-				uint32_t newStrd = planStrd;
-				if (tiling == 1) {
-					newStrd = planStrd * 8;
-				} else if (tiling == 4) {
-					newStrd = planStrd * 16;
-				}
-				NGreen::callback->writeReg32(0x70180, newCtl);
-				NGreen::callback->writeReg32(0x70188, newStrd);
-				uint32_t planSurf = NGreen::callback->readReg32(0x7019C);
-				NGreen::callback->writeReg32(0x7019C, planSurf);
-				SYSLOG("ngreen", "V79[%d]: tiling %d->linear CTL 0x%x->0x%x STRIDE 0x%x->0x%x SURF=0x%x",
-						   v60Count, tiling, planCtl, newCtl, planStrd, newStrd, planSurf);
-			} else {
-				SYSLOG("ngreen", "V79[%d]: already linear CTL=0x%x STRIDE=0x%x", v60Count, planCtl, planStrd);
-			}
-		}
 	}
 	
 	// 6. Log with ring + CSB focus
@@ -3291,7 +3261,8 @@ void Gen11::v54IrqWatchdog(thread_call_param_t param0, thread_call_param_t) {
 		SYSLOG("ngreen", "V54W: watchdog complete after %d iterations", v54WatchdogCount);
 	}
 }
-// V44: Bundle/property logging helper — logs Metal/GL/VA bundle names after a delay.
+// V44: Bundle/property logging disabled — commented out to reduce boot-time overhead.
+#if 0
 static const char *v44SafeCString(OSString *str) {
     if (!str) {
         return "MISSING";
@@ -3342,6 +3313,7 @@ static void v44ScheduleBundleLog(void *accelInstance, unsigned delayMs) {
         svc->release();
     }
 }
+#endif
 
 bool Gen11::start(void *that,void  *param_1)
 {
@@ -3873,9 +3845,7 @@ bool Gen11::start(void *that,void  *param_1)
 		bool hasVARID = (accelSvc->getProperty("IOVARendererID") != nullptr);
 		SYSLOG("ngreen", "V45: properties present: MetalPlugin=%d GL=%d CFPlugIn=%d VARend=%d",
 			   hasMetal, hasGL, hasCFPI, hasVARID);
-			   
-		v44ScheduleBundleLog(that, 500); // TEST
-
+		
 		// 5. If MetalPluginName is missing, set GPU properties directly on the service
 		//    (normally they come from the matched personality, but if IOKit didn't merge them...)
 		if (!hasMetal) {
@@ -3981,24 +3951,20 @@ bool Gen11::start(void *that,void  *param_1)
 				}
 			}
 
-			// V60: GPU health monitor (contains V77 DisplayPipe terminator) — opt-in only.
-			// Without this, IOAccelDisplayPipeUserClient2 is NOT killed after V59 opens it.
+			// V60: GPU health monitor (contains V77 DisplayPipe terminator) — runs unconditionally.
+			// Required: kills IOAccelDisplayPipeUserClient2 after V59 opens it, preventing stuck client.
 			// Retain the IOService so it stays alive while a timer is pending (UAF fix).
-			if (isV60MonitorEnabled()) {
-				auto *monSvc = static_cast<IOService *>(that);
-				monSvc->retain();
-				auto monTimer = thread_call_allocate(v60GpuHealthMonitor,
+			auto *monSvc = static_cast<IOService *>(that);
+			monSvc->retain();
+			auto monTimer = thread_call_allocate(v60GpuHealthMonitor,
 										 static_cast<thread_call_param_t>(monSvc));
-				if (monTimer) {
-					uint64_t deadline;
-					clock_interval_to_deadline(2, kSecondScale, &deadline);
-					thread_call_enter_delayed(monTimer, deadline);
-					SYSLOG("ngreen", "V60: GPU health monitor armed — 2s interval, 60 iterations (120s)");
-				} else {
-					monSvc->release(); // alloc failed — drop our retain
-				}
+			if (monTimer) {
+				uint64_t deadline;
+				clock_interval_to_deadline(2, kSecondScale, &deadline);
+				thread_call_enter_delayed(monTimer, deadline);
+				SYSLOG("ngreen", "V60: GPU health monitor armed — 2s interval, 60 iterations (120s)");
 			} else {
-				SYSLOG("ngreen", "V110: V60 health monitor disabled (use -ngreenexp/-ngreenv60 to enable, -ngreenv60off to force disable)");
+				monSvc->release(); // alloc failed — drop our retain
 			}
 		}
 	}
