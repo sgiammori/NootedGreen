@@ -50,6 +50,10 @@ static KernelPatcher::KextInfo kextG11HWTA {"com.apple.driver.AppleIntelTGLGraph
 	{false, false, false, true}, {},
 	KernelPatcher::KextInfo::Unloaded};
 
+// IOAcceleratorFamily2 symbols are resolved inside NGreen::processKext via
+// kextIOAcceleratorFamily2 (kern_green.cpp) which already has the valid path.
+// No separate kextIOAF2 registration needed here.
+
 Gen11 *Gen11::callback = nullptr;
 
 void Gen11::init() {
@@ -105,13 +109,24 @@ static bool isV60MonitorEnabled() {
 	return isExperimentalMonitorEnabled();
 }
 
-static bool isLegacyOwnershipModeEnabled();
+static bool isLegacyOwnershipModeEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenlegacyown", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenlegacyown");
+}
 
 static bool isDisplayPipeForceDisabled() {
 	if (isLegacyOwnershipModeEnabled()) {
 		SYSLOG("ngreen", "V78A: legacy ownership mode forcing DisplayPipeSupported=0");
 		return true;
 	}
+	// NOTE: isLegacyOwnershipModeEnabled() (V80 plane-linearization) is intentionally
+	// NOT checked here. V80 writes are self-limiting to the first 3 ticks (≤150ms) and
+	// must not prevent WindowServer from opening the display pipe after that window.
+	// Coupling these two features caused DisplayPipeSupported=0 → black screen forever.
 
 	// Stage-3 baseline now has DYLD-side NULL guards for DisplayPipe path.
 	// Keep native DisplayPipe ON by default and use ngreendp0 only as an explicit
@@ -150,15 +165,6 @@ static bool isV93PlaneGuardEnabled() {
 	}
 
 	return checkKernelArgument("-ngreenv93");
-}
-
-static bool isReferenceF2ProbeEnabled() {
-	int enabled = 0;
-	if (PE_parse_boot_argn("ngreenRefProbeF2", &enabled, sizeof(enabled))) {
-		return enabled != 0;
-	}
-
-	return checkKernelArgument("-ngreenRefProbeF2");
 }
 
 static bool shouldForceFullMetalPath() {
@@ -229,28 +235,26 @@ static bool isV60AggressiveMonitorEnabled() {
 	return checkKernelArgument("-ngreenv60rw");
 }
 
-static bool isLegacyOwnershipModeEnabled() {
-	int enabled = 0;
-	if (PE_parse_boot_argn("ngreenlegacyown", &enabled, sizeof(enabled))) {
-		return enabled != 0;
-	}
-
-	return checkKernelArgument("-ngreenlegacyown");
-}
-
 static bool isV80LEnforcerEnabled() {
 	return checkKernelArgument("-ngreenv80l");
 }
 
 static uint32_t getV65Tier1WantBits(bool isRealTGL) {
-	// RPL/ADL spoof path keeps BCS disabled; forcing BCS tier-1 IRQ enable on a
-	// disabled ring can trigger restart loops. Keep RCS-only by default.
-	if (!isRealTGL && !checkKernelArgument("-ngreenbcsirq")) {
-		return (1u << GEN11_RCS0);
+	// Real TGL: always use native behavior (RCS + BCS).
+	if (isRealTGL) {
+		return (1u << GEN11_RCS0) | (1u << GEN11_BCS);
 	}
 
-	// Real TGL keeps native behavior; spoof path can opt in with -ngreenbcsirq.
-	return (1u << GEN11_RCS0) | (1u << GEN11_BCS);
+	// RPL/ADL spoof path: BCS must be enabled when the original submitBlit path
+	// (V142 mode 3) is active — that path submits directly to BCS ring. Leaving
+	// BCS out of the want bits means RING_CTRL never gets the enable bit set,
+	// commands queue up and the ring stalls (gpuRestart Signature 801).
+	// For other V142 modes (0/1/2 = bypass/return0) BCS is idle, keep RCS-only.
+	if (getV142SubmitBlitMode() == 3 || checkKernelArgument("-ngreenbcsirq")) {
+		return (1u << GEN11_RCS0) | (1u << GEN11_BCS);
+	}
+
+	return (1u << GEN11_RCS0);
 }
 
 static int getV77KillDelayIterations() {
@@ -268,7 +272,6 @@ static int getV77KillDelayIterations() {
 }
 
 bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-	
 	if (kextG11FB.loadIndex == index) {
 		if (this->tglFBLoaded) {
 			DBGLOG("ngreen", "Skipping ICL FB — TGL FB already loaded");
@@ -712,7 +715,6 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesp , address, size), "ngreen", "kextG11FBT Failed to apply production patches!");
 		}
 		else {
-			const bool refProbeF2 = isReferenceF2ProbeEnabled();
 			LookupPatchPlus const patches[] = {// tgl debug kext
 				{activeKext, f1, r1, arrsize(f1),	1},
 				// f2 (osinfo pipe/port/fb counts) disabled: wrong counts can corrupt scanout layout
@@ -750,7 +752,6 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11FBT Failed to apply dbg patches!");
 
-			if (refProbeF2 && !NGreen::callback->isRealTGL) {
 				// Reference probe: enable only old f2 topology/osinfo bypass on demand.
 				// Keeps current stability protections while testing whether f2 is the flash trigger.
 				LookupPatchPlus const probeF2Patch[] = {
@@ -759,9 +760,6 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				PANIC_COND(!LookupPatchPlus::applyAll(patcher, probeF2Patch, address, size),
 					"ngreen", "kextG11FBT Failed to apply reference f2 probe patch!");
 				SYSLOG("ngreen", "V109: reference probe enabled (f2 osinfo patch active)");
-			} else if (refProbeF2) {
-				SYSLOG("ngreen", "V109: reference f2 probe requested but ignored on real TGL");
-			}
 		}
 		
 		return true;
@@ -983,9 +981,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			 // We route it only to scope temporary getter fallback (no broad bypass).
 			 {"__Z17barrierSubmissionR19IGAccelCommandQueueR16IntelAcceleratorR24IGAccelCommandDescriptorR12IOAccelEventtPKt", barrierSubmission, this->obarrierSubmission},
 			 
-			 // V117: Hook getBlit2DContext — on RPL, BCS ring was never started (CTL=0x0).
-			 // Apple's original creates a Blit2D context and submits it to BCS, whose ring ring
-			 // buffer contains zeros → GPU hang → reset. Return null to suppress BCS usage.
+			 // V117: Hook getBlit2DContext for null-guarding only.
+			 // submitBlit expects a real Blit2D context layout and unconditionally reads
+			 // [ctx+0xb8], so we must never substitute depth/color/3D context objects here.
 			 {"__ZN11IGAccelTask16getBlit2DContextEb", getBlit2DContext, this->ogetBlit2DContext},
 
 			 // Resolve-context getters are used by barrierSubmission and are generally safe.
@@ -998,8 +996,6 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		SYSLOG("ngreen", "V165: HW accelerator symbols routed OK");
 
 		{
-			// Route IntelAccelerator::start when available so Gen11::start diagnostics run.
-			// Keep this non-fatal because symbol names vary between Sonoma builds.
 			RouteRequestPlus startRoute[] = {
 				{"__ZN16IntelAccelerator5startEP9IOService", start, this->ostart},
 			};
@@ -2217,7 +2213,9 @@ static void v45DelayedChildCheck(thread_call_param_t p0, thread_call_param_t p1)
 				if (delayMs >= 3000) {
 					const char *childName = child->getName();
 					if (childName && (strcmp(childName, "IGAccelDevice") == 0 ||
-									  strcmp(childName, "IGAccelSharedUserClient") == 0)) {
+									  strcmp(childName, "IGAccelSharedUserClient") == 0 ||
+									  strcmp(childName, "IOAccelDisplayPipeUserClient2") == 0 ||
+									  strcmp(childName, "IGAccelCommandQueue") == 0)) {
 						// Dump child's provider and property state
 						auto *childProvider = child->getProvider();
 						SYSLOG("ngreen", "V55: %s state=0x%llx provider=%s isOpen=%d",
@@ -2439,7 +2437,7 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 
 	// 5. V60: error suppression path. Default is read-only for stability.
 	// Use -ngreenv60rw to enable active register writes during monitor ticks.
-	if (v60Aggressive) {
+	/*if (v60Aggressive) {
 		if (realErr) {
 			NGreen::callback->writeReg32(ERROR_GEN6, 0x0);
 		}
@@ -2476,6 +2474,16 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 				SYSLOG("ngreen", "V79[%d]: already linear CTL=0x%x STRIDE=0x%x", v60Count, planCtl, planStrd);
 			}
 		}
+	}*/
+
+	// 5. V60: ACTIVE error suppression (V57 proven approach)
+	//    Clear ERROR_GEN6 by writing 0x0, re-mask EMR every cycle
+	if (realErr) {
+		NGreen::callback->writeReg32(ERROR_GEN6, 0x0);
+	}
+	// Re-mask EMR every cycle — Apple may unmask during error recovery attempts
+	if (emr != 0xFFFFFFFF) {
+		NGreen::callback->writeReg32(RING_EMR(RENDER_RING_BASE), 0xFFFFFFFF);
 	}
 	
 	// 6. Log with ring + CSB focus
@@ -2682,7 +2690,7 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	// V65: Enforce RCS0 interrupt enable on EVERY iteration (moved from V64 iteration 5).
 	// V64 proved the fix at T+10s was too late — scheduler already gave up.
 	// Now combined with V65 pre-start + V65W watchdog fixes for full coverage.
-	if (v60Aggressive) {
+	/*if (v60Aggressive) {
 		uint32_t rcIntrEn = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
 		uint32_t rcsMask  = NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK);
 		
@@ -2705,12 +2713,40 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 				SYSLOG("ngreen", "V65M[%d]: tier-2 fix mask 0x%x->0x%x", v60Count, rcsMask, newMask);
 			}
 		}
+	}*/
+
+	// V65: Enforce RCS0 interrupt enable on EVERY iteration (moved from V64 iteration 5).
+	// V64 proved the fix at T+10s was too late — scheduler already gave up.
+	// Now combined with V65 pre-start + V65W watchdog fixes for full coverage.
+	{
+		uint32_t rcIntrEn = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
+		uint32_t rcsMask  = NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK);
+		
+		// Enable RCS+BCS in tier-1 interrupt enable (bit 0 = RCS0, bit 15 = BCS)
+		uint32_t wantBits = (1 << GEN11_RCS0) | (1 << GEN11_BCS);
+		if ((rcIntrEn & wantBits) != wantBits) {
+			uint32_t newEn = rcIntrEn | wantBits;
+			NGreen::callback->writeReg32(GEN11_RENDER_COPY_INTR_ENABLE, newEn);
+			if (v60Count <= 3) {
+				SYSLOG("ngreen", "V65M[%d]: tier-1 fix 0x%x->0x%x", v60Count, rcIntrEn,
+					NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE));
+			}
+		}
+		// Unmask context-switch + user interrupt for RCS (0 = unmasked, 1 = masked)
+		uint32_t wantUnmasked = GT_CONTEXT_SWITCH_INTERRUPT | GT_RENDER_USER_INTERRUPT;
+		if (rcsMask & wantUnmasked) {
+			uint32_t newMask = rcsMask & ~wantUnmasked;
+			NGreen::callback->writeReg32(GEN11_RCS0_RSVD_INTR_MASK, newMask);
+			if (v60Count <= 3) {
+				SYSLOG("ngreen", "V65M[%d]: tier-2 fix mask 0x%x->0x%x", v60Count, rcsMask, newMask);
+			}
+		}
 	}
 	
 	// ── V79: Plane monitor (strictly read-only) ──
 	// Any plane-format writes here have caused either WS crash loops or WS hangs.
 	// Keep this path logging-only; never modify PLANE_CTL/STRIDE/SURF in V60.
-	{
+	/*{
 		uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
 		uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
 		uint32_t planSurf = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
@@ -2720,6 +2756,45 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
 
 		// Always log plane state for diagnostics
+		SYSLOG("ngreen", "V79[%d]: PIPE=0x%x CTL=0x%x STRIDE=0x%x SURF=0x%x SIZE=0x%x POS=0x%x tiling=%d",
+			   v60Count, pipeConf, planCtl, planStrd, planSurf, planSize, planPos, tiling);
+	}*/
+
+	// ── V79: Plane monitor / experimental linearization ──
+	// The old copy only reached brief first-light when the experimental path forced
+	// the scanout plane to linear and re-armed PLANE_SURF. Keep the default path
+	// read-only; restore the old behavior only with -ngreenexp.
+	if (isExperimentalMonitorEnabled()) {
+		if (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30) {
+			uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
+			uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
+			uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
+			if (tiling != 0) {
+				uint32_t newCtl = planCtl & ~(0x7u << 10); // clear tiling -> linear
+				uint32_t newStrd = planStrd;
+				if (tiling == 1) {
+					newStrd = planStrd * 8;
+				} else if (tiling == 4) {
+					newStrd = planStrd * 16;
+				}
+				NGreen::callback->writeReg32(0x70180, newCtl);
+				NGreen::callback->writeReg32(0x70188, newStrd);
+				uint32_t planSurf = NGreen::callback->readReg32(0x7019C);
+				NGreen::callback->writeReg32(0x7019C, planSurf);
+				SYSLOG("ngreen", "V79[%d]: tiling %d->linear CTL 0x%x->0x%x STRIDE 0x%x->0x%x SURF=0x%x",
+					   v60Count, tiling, planCtl, newCtl, planStrd, newStrd, planSurf);
+			} else {
+				SYSLOG("ngreen", "V79[%d]: already linear CTL=0x%x STRIDE=0x%x", v60Count, planCtl, planStrd);
+			}
+		}
+	} else {
+		uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
+		uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
+		uint32_t planSurf = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
+		uint32_t planSize = NGreen::callback->readReg32(0x70190); // PLANE_SIZE
+		uint32_t planPos  = NGreen::callback->readReg32(0x7018C); // PLANE_POS
+		uint32_t pipeConf = NGreen::callback->readReg32(0x70008); // PIPE_CONF_A
+		uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
 		SYSLOG("ngreen", "V79[%d]: PIPE=0x%x CTL=0x%x STRIDE=0x%x SURF=0x%x SIZE=0x%x POS=0x%x tiling=%d",
 			   v60Count, pipeConf, planCtl, planStrd, planSurf, planSize, planPos, tiling);
 	}
@@ -5783,29 +5858,36 @@ void * Gen11::getBlit3DContext(void *that,bool param_1)
 	// set it for RPL hardware). All callers that dereference ctx+0xb8 are already guarded
 	// with !isRealTGL returns (initBlitUsage V121, markBlitUsage V122, beginCoalescedSegment
 	// V124, barrierSubmission V130). Accept any non-null ctx on RPL.
-	if (callback->v131CachedBlit3DCtx) {
-		void *b8 = getMember<void *>(callback->v131CachedBlit3DCtx, 0xb8);
-		if (b8 || !NGreen::callback->isRealTGL) {
-			if (isExperimentalMonitorEnabled())
-				SYSLOG("ngreen", "V148: getBlit3DContext using cached ctx=%p ctx+0xb8=%p",
-				       callback->v131CachedBlit3DCtx, b8);
-			return callback->v131CachedBlit3DCtx;
-		}
-	}
-
-	// Call Apple's original — it allocates, constructs, calls initWithOptions→initialize.
-	// Our initialize hook (V148) handles the RPL-safe init path.
-	// V165: On RPL accept ctx even when ctx+0xb8=NULL (base class doesn't set it on RPL).
+	//
+	// V194: Always call Apple's original first. After gpuRestart the GPU is reset and all
+	// context objects are freed/reallocated. Apple's getBlit3DContext(task, true) checks
+	// task+0x298 and returns the current live context for that task. If it returns a
+	// DIFFERENT non-null ctx than our cache, it means restart happened — update the cache.
+	// Only fall back to the stale cache when Apple's original returns null (early init).
 	if (callback->ogetBlit3DContext) {
 		void *ctx = FunctionCast(getBlit3DContext, callback->ogetBlit3DContext)(that, param_1);
 		void *b8 = ctx ? getMember<void *>(ctx, 0xb8) : nullptr;
 		if (ctx && (b8 || !NGreen::callback->isRealTGL)) {
-			callback->v131CachedBlit3DCtx = ctx;
-			SYSLOG("ngreen", "V148: getBlit3DContext original succeeded ctx=%p ctx+0xb8=%p", ctx, b8);
+			if (ctx != callback->v131CachedBlit3DCtx) {
+				SYSLOG("ngreen", "V194: getBlit3DContext ctx changed %p -> %p (restart recovery), updating cache",
+				       callback->v131CachedBlit3DCtx, ctx);
+				callback->v131CachedBlit3DCtx = ctx;
+			} else if (isExperimentalMonitorEnabled()) {
+				SYSLOG("ngreen", "V148: getBlit3DContext using cached ctx=%p ctx+0xb8=%p",
+				       ctx, b8);
+			}
 			return ctx;
 		}
 		SYSLOG("ngreen", "V148: getBlit3DContext original returned invalid ctx=%p ctx+0xb8=%p",
 		       ctx, b8);
+	}
+
+	// Apple's original returned null (early init) — fall back to previously cached ctx.
+	if (callback->v131CachedBlit3DCtx) {
+		if (isExperimentalMonitorEnabled())
+			SYSLOG("ngreen", "V148: getBlit3DContext using cached ctx=%p (original returned null)",
+			       callback->v131CachedBlit3DCtx);
+		return callback->v131CachedBlit3DCtx;
 	}
 
 	// Fallbacks: depth/color resolve contexts share the same +0xb8 layout.
@@ -5826,6 +5908,215 @@ void * Gen11::getBlit3DContext(void *that,bool param_1)
 	SYSLOG("ngreen", "V148: getBlit3DContext all paths exhausted");
 	return nullptr;
 }
+
+uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param_3, bool param_4) {
+	// V186: For spoofed non-TGL, if V142 is configured to bypass submitBlit,
+	// return before any task/context touching logic. The V149/V171 path writes
+	// task+0x298 and can poison task lifetime on some boots, later crashing in
+	// IGAccelTask::release from the garbage collector interrupt path.
+	if (!NGreen::callback->isRealTGL) {
+		static int v186Mode = -1;
+		if (v186Mode < 0) {
+			v186Mode = getV142SubmitBlitMode();
+			SYSLOG("ngreen", "V186: early submitBlit spoof mode=%d (0=unsupported,1=ret0,2=ret1,3=orig)", v186Mode);
+		}
+
+		if (v186Mode != 3) {
+			if (isV142Diag2DBypassEnabled() && param_1) {
+				auto *blit = reinterpret_cast<uint8_t *>(param_1);
+				const bool has3DFlags =
+					((blit[0x3C] & 1U) != 0) ||
+					((blit[0x84] & 1U) != 0) ||
+					(*reinterpret_cast<uint64_t *>(blit + 0x20) != 0) ||
+					(*reinterpret_cast<uint64_t *>(blit + 0x68) != 0);
+				const uint32_t routeSel = (blit[0xA2] >> 3U) & 0x3U;
+				static int v186DiagCount = 0;
+				if (v186DiagCount < 64) {
+					v186DiagCount++;
+					SYSLOG("ngreen", "V186D[%d]: mode=%d routeSel=%u has3D=%d task=%p",
+					       v186DiagCount, v186Mode, routeSel, (int)has3DFlags, param_3);
+				}
+			}
+			if (v186Mode == 2)
+				return 1;
+			if (v186Mode == 1)
+				return 0;
+			return static_cast<uint32_t>(kIOReturnUnsupported);
+		}
+	}
+
+	// V149: blit3D context is cached at task+0x298 per IGAccelTask::getBlit3DContext IDA.
+	// Previous code used 0xb8 — that overwrote an unrelated IGAccelTask member.
+	auto ensureTaskContext = [&](void *task, const char *origin) -> void * {
+		if (!task || NGreen::callback->isRealTGL)
+			return task ? getMember<void *>(task, 0x298) : nullptr;
+
+		void *taskCtx = getMember<void *>(task, 0x298);
+		if (taskCtx)
+			return taskCtx;
+
+		// param_1=true triggers allocation; Apple then stores result at task+0x298 internally.
+		// V171: Our getBlit3DContext hook returns the global cached ctx but does NOT write
+		// task+0x298. Apple's original would store it per-task. Do it explicitly here so
+		// the invalidTask check (getMember<void*>(task,0x298) == nullptr) passes.
+		void *ctx = callback->getBlit3DContext(task, true);
+		if (!ctx)
+			return nullptr;
+
+		getMember<void *>(task, 0x298) = ctx;
+
+		if (isExperimentalMonitorEnabled()) {
+			static int v149Count = 0;
+			if (v149Count < 32) {
+				v149Count++;
+				SYSLOG("ngreen", "V149[%d]: %s task=%p stored ctx@298=%p", v149Count, origin, task, ctx);
+			}
+		}
+
+		return ctx;
+	};
+
+	bool invalidTask = (param_3 == nullptr);
+	if (isExperimentalMonitorEnabled()) {
+		static int v137SubmitEntryCount = 0;
+		if (v137SubmitEntryCount < 40) {
+			v137SubmitEntryCount++;
+			void *entryVtable = param_3 ? getMember<void *>(param_3, 0x0) : nullptr;
+			void *entryCtx = param_3 ? getMember<void *>(param_3, 0x298) : nullptr;
+			SYSLOG("ngreen", "V149.submitBlit.entry[%d]: acc=%p p1=%p p2=%p task=%p vtbl=%p ctx@298=%p b=%u c3D=%p c2D=%p cTask=%p",
+			       v137SubmitEntryCount, that, param_1, param_2, param_3, entryVtable, entryCtx,
+			       static_cast<unsigned>(param_4), callback->v131CachedBlit3DCtx,
+			       callback->v131CachedBlit2DCtx, callback->v132CachedTask);
+		}
+	}
+	if (!invalidTask) {
+		// V135: Some panics still reached Apple submitBlit with a non-null but broken task object
+		// (null vtable / null ctx field), which can lead to RIP=0 indirect calls in Apple code.
+		// Validate minimal task invariants before calling through.
+		ensureTaskContext(param_3, "submitBlit-incoming");
+		void *taskVtable = getMember<void *>(param_3, 0x0);
+		void *taskCtx = getMember<void *>(param_3, 0x298);
+		invalidTask = (taskVtable == nullptr) || (taskCtx == nullptr);
+		if (invalidTask) {
+			static int v135Count = 0;
+			if (v135Count < 16) {
+				v135Count++;
+				SYSLOG("ngreen", "V149[%d]: submitBlit invalid task=%p vtbl=%p ctx@298=%p", v135Count, param_3, taskVtable, taskCtx);
+			}
+		}
+	}
+
+	if (invalidTask && callback->v132CachedTask && callback->v132CachedTask != param_3) {
+		void *cachedCtx = ensureTaskContext(callback->v132CachedTask, "submitBlit-cached");
+		void *cachedVtable = getMember<void *>(callback->v132CachedTask, 0x0);
+		if (cachedVtable && cachedCtx) {
+			if (isExperimentalMonitorEnabled()) {
+				static int v138SwapCount = 0;
+				if (v138SwapCount < 24) {
+					v138SwapCount++;
+					SYSLOG("ngreen", "V138.swap[%d]: replacing task=%p with cached=%p ctx=%p",
+					       v138SwapCount, param_3, callback->v132CachedTask, cachedCtx);
+				}
+			}
+			param_3 = callback->v132CachedTask;
+			invalidTask = false;
+		}
+	}
+
+	if (invalidTask) {
+		static int v120Mode = -1;
+		if (v120Mode < 0) {
+			int parsed = 0;
+			if (!NGreen::callback->isRealTGL) {
+				// V120 modes for spoofed path:
+				//   ngreenV120=0 or -ngreenV120ok   -> return success (legacy behavior)
+				//   ngreenV120=1 or -ngreenV120fail -> return unsupported (default)
+				//   ngreenV120=2 or -ngreenV120pass -> return 1
+				if (PE_parse_boot_argn("ngreenV120", &parsed, sizeof(parsed))) {
+					v120Mode = parsed;
+				} else if (checkKernelArgument("-ngreenV120pass")) {
+					v120Mode = 2;
+				} else if (checkKernelArgument("-ngreenV120ok")) {
+					v120Mode = 0;
+				} else if (checkKernelArgument("-ngreenV120fail")) {
+					v120Mode = 1;
+				} else {
+					v120Mode = 1;
+				}
+			} else {
+				v120Mode = 0;
+			}
+			SYSLOG("ngreen", "V120: submitBlit NULL-task mode=%d (0=ret0,1=unsupported,2=ret1)", v120Mode);
+		}
+
+		static int v120NullCount = 0;
+		if (v120NullCount < 32) {
+			v120NullCount++;
+			SYSLOG("ngreen", "V120[%d]: submitBlit NULL task that=%p p1=%p p2=%p bool=%d mode=%d",
+			       v120NullCount, that, param_1, param_2, param_4, v120Mode);
+		}
+
+		if (isExperimentalMonitorEnabled()) {
+			static int v137SubmitInvalidCount = 0;
+			if (v137SubmitInvalidCount < 40) {
+				v137SubmitInvalidCount++;
+				SYSLOG("ngreen", "V137.submitBlit.invalid[%d]: task=%p cTask=%p c3D=%p c2D=%p mode=%d",
+				       v137SubmitInvalidCount, param_3, callback->v132CachedTask,
+				       callback->v131CachedBlit3DCtx, callback->v131CachedBlit2DCtx, v120Mode);
+			}
+		}
+
+		if (v120Mode == 2)
+			return 1;
+		if (v120Mode == 1)
+			return static_cast<uint32_t>(kIOReturnUnsupported);
+		return 0;
+	}
+
+	if (!NGreen::callback->isRealTGL) {
+		// V142: after the movaps/movapd fixes, the remaining watchdog still points at
+		// Apple's original blit submit path wedging BCS. Keep original behavior by default
+		// to avoid breaking the renderer, but provide an explicit no-log test switch for
+		// spoofed RPL boots when we need to prove the hang is inside submitBlit itself.
+		static int v142Mode = -1;
+		if (v142Mode < 0) {
+			v142Mode = getV142SubmitBlitMode();
+			SYSLOG("ngreen", "V142: submitBlit spoof mode=%d (0=hard-unsupported,1=ret0,2=ret1,3=orig)", v142Mode);
+		}
+
+		if (v142Mode != 3) {
+			static int v142Count = 0;
+			if (v142Count < 24) {
+				v142Count++;
+				SYSLOG("ngreen", "V142[%d]: bypass submitBlit acc=%p p1=%p p2=%p task=%p b=%u mode=%d",
+				       v142Count, that, param_1, param_2, param_3, static_cast<unsigned>(param_4), v142Mode);
+			}
+
+			if (v142Mode == 2)
+				return 1;
+			if (v142Mode == 1)
+				return 0;
+			// Mode 0 is intentionally harsh and should only be used for explicit diagnostics.
+			return static_cast<uint32_t>(kIOReturnUnsupported);
+		}
+	}
+
+	// Safety guard: avoid null indirect call if route capture failed.
+	if (!callback->osubmitBlit) {
+		static bool v134Logged = false;
+		if (!v134Logged) {
+			v134Logged = true;
+			SYSLOG("ngreen", "V134: osubmitBlit is null, preventing call-through crash");
+		}
+		if (!NGreen::callback->isRealTGL)
+			return 0;
+		return static_cast<uint32_t>(kIOReturnUnsupported);
+	}
+
+	return FunctionCast(submitBlit, callback->osubmitBlit)(that, param_1, param_2, param_3, param_4);
+}
+
+/* newer stub
 
 // submitBlit controls early screen bring-up and compositor blits.
 // On spoofed non-TGL we use the decompiled control split encoded in blit[0xA2] bits[4:3]:
@@ -6040,6 +6331,26 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 		}
 	}
 
+	// V193: On !isRealTGL (RPL spoof), block routeSel=3 before calling Apple's submitBlit.
+	// routeSel=3 routes to blit3d_submit_commands which executes TGL-compiled EU shaders
+	// from the scratch buffer. RPL has a different EU topology — the shader unit stalls
+	// (INSTDONE_1 bit clear), RCS hangs inside the batch at BB_ADDR, BCS then deadlocks
+	// on a MI_SEMAPHORE_WAIT for the value RCS never writes → Sig 803 GPU reset loop.
+	// Side effect: cursor sprite (which uses routeSel=3) becomes invisible — acceptable
+	// vs. a hard GPU hang every ~15s.
+	/*if (!NGreen::callback->isRealTGL && param_1) {
+		auto *blit193 = reinterpret_cast<uint8_t *>(param_1);
+		const uint32_t routeSel193 = (blit193[0xA2] >> 3U) & 0x3U;
+		if (routeSel193 == 3) {
+			static int v193Count = 0;
+			if (v193Count < 32) {
+				v193Count++;
+				SYSLOG("ngreen", "V193[%d]: blocked routeSel=3 on RPL (TGL EU shader → RCS hang)", v193Count);
+			}
+			return 1;
+		}
+	}*
+
 	// Safety guard: avoid null indirect call if route capture failed.
 	if (!callback->osubmitBlit) {
 		static bool v134Logged = false;
@@ -6053,7 +6364,7 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 	}
 
 	return FunctionCast(submitBlit, callback->osubmitBlit)(that, param_1, param_2, param_3, param_4);
-}
+}*/
 
 void * Gen11::getBlit2DContext(void *that,bool param_1)
 {
@@ -6068,41 +6379,15 @@ void * Gen11::getBlit2DContext(void *that,bool param_1)
 		}
 	}
 	
-	// V127: On non-real-TGL (RPL spoof), allow Blit2D context to initialize so that
-	// barrierSubmission (which dereferences ctx+0xb8 unconditionally) doesn't crash.
-	// We call the original and validate ctx+0xb8 before returning: if the context
-	// initialized correctly (field non-null), return it — barrierSubmission is safe.
-	// If ctx+0xb8 is null (init faulted or incomplete), prefer a validated resolve
-	// context fallback so barrierSubmission does not dereference a null task pointer.
-	// BCS submission guard remains upstream (submitBlit V120 + beginCoalescedSegment V124).
+	// V127: On non-real-TGL (RPL spoof), call the original getter and enforce only
+	// Blit2D-compatible fallbacks. submitBlit dereferences [ctx+0xb8] and then uses the
+	// resulting object as Blit2D FIFO/ring state, so returning depth/color/3D contexts here
+	// can corrupt renderer behavior (black output / wrong ring routing).
 	if (!NGreen::callback->isRealTGL) {
-		auto fallbackResolveCtx = [&]() -> void * {
-			void *depth = getDepthResolveContext(that, param_1);
-			void *depthCtx = depth ? getMember<void *>(depth, 0xb8) : nullptr;
-			if (isExperimentalMonitorEnabled()) {
-				static int v137Blit2DFallbackCount = 0;
-				if (v137Blit2DFallbackCount < 40) {
-					v137Blit2DFallbackCount++;
-					SYSLOG("ngreen", "V137.getBlit2DContext[%d]: depth=%p depthCtx=%p", v137Blit2DFallbackCount, depth, depthCtx);
-				}
-			}
-			if (depth && getMember<void *>(depth, 0xb8)) {
-				DBGLOG("ngreen", "V129: getBlit2DContext using depth-resolve fallback");
-				return depth;
-			}
-			void *color = getColorResolveContext(that, param_1);
-			void *colorCtx = color ? getMember<void *>(color, 0xb8) : nullptr;
-			if (isExperimentalMonitorEnabled()) {
-				static int v137Blit2DFallbackColorCount = 0;
-				if (v137Blit2DFallbackColorCount < 40) {
-					v137Blit2DFallbackColorCount++;
-					SYSLOG("ngreen", "V137.getBlit2DContext.color[%d]: color=%p colorCtx=%p", v137Blit2DFallbackColorCount, color, colorCtx);
-				}
-			}
-			if (color && getMember<void *>(color, 0xb8)) {
-				DBGLOG("ngreen", "V129: getBlit2DContext using color-resolve fallback");
-				return color;
-			}
+		auto cachedValid2D = [&]() -> void * {
+			void *cached = callback->v131CachedBlit2DCtx;
+			if (cached && getMember<void *>(cached, 0xb8))
+				return cached;
 			return nullptr;
 		};
 
@@ -6112,7 +6397,7 @@ void * Gen11::getBlit2DContext(void *that,bool param_1)
 				v136Logged = true;
 				SYSLOG("ngreen", "V136: ogetBlit2DContext is null");
 			}
-			void *fallback = fallbackResolveCtx();
+			void *fallback = cachedValid2D();
 			if (fallback)
 				return fallback;
 			return nullptr;
@@ -6128,26 +6413,19 @@ void * Gen11::getBlit2DContext(void *that,bool param_1)
 		}
 		if (!ctx) {
 			DBGLOG("ngreen", "V127: getBlit2DContext original returned null on RPL");
-			void *fallback = fallbackResolveCtx();
+			void *fallback = cachedValid2D();
 			if (fallback)
 				return fallback;
-			// V131: When resolve fallback also fails, use cached 3D context as 2D fallback
-			if (callback->v131CachedBlit3DCtx) {
-				SYSLOG("ngreen", "V131: getBlit2DContext using cached 3D context as fallback");
-				return callback->v131CachedBlit3DCtx;
-			}
+			// No cross-context fallback allowed here (depth/color/3D are incompatible layouts).
 			return nullptr;
 		}
 		void *ctxField = getMember<void *>(ctx, 0xb8);
 		if (!ctxField) {
-			DBGLOG("ngreen", "V127: getBlit2DContext ctx+0xb8 NULL on RPL, trying resolve fallback");
-			void *fallback = fallbackResolveCtx();
+			DBGLOG("ngreen", "V127: getBlit2DContext ctx+0xb8 NULL on RPL, trying cached Blit2D fallback");
+			void *fallback = cachedValid2D();
 			if (fallback)
 				return fallback;
-			// V131: Cache this 2D context even with null field if no other option
-			callback->v131CachedBlit2DCtx = ctx;
-			SYSLOG("ngreen", "V131: getBlit2DContext caching partial context as fallback");
-			return ctx;
+			return nullptr;
 		}
 		DBGLOG("ngreen", "V127: getBlit2DContext ctx=%p ctx+0xb8=%p OK on RPL", ctx, ctxField);
 		// V131: Cache valid context for future NULL fallback
@@ -6272,14 +6550,16 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 	const bool skipOriginal = checkKernelArgument("-ngreenV69SkipOriginal");
 	uint64_t gpuBufBase = mappedBufPtr ? getMember<uint64_t>(mappedBufPtr, 0x18) : 0;
 	uint64_t gpuBufSize = mappedBufPtr ? getMember<uint64_t>(mappedBufPtr, 0x20) : 0;
-	// V181: blit3d_initialize_scratch_space is now a no-op on !isRealTGL (the only step
-	// in initialize() that caused a write fault). With that intercepted, the original
-	// initialize() is safe to call — it will zero the header fields, skip the scratch write
-	// (our hook), and call blit3d_init_ctx, which is what enables getBlit2DContext.
+	// Calling the original Blit3D initialize on spoofed RPL/ADL is still unsafe on Sonoma:
+	// crashes observed at initialize+0x4c with a write fault to the mapped scratch page.
+	// Keep original path blocked by default even when -ngreenV69AllowOriginal is set.
+	// Only allow with explicit unsafe override for debugging.
 	// GPU VA is at mappedBuf[0x38], size at [0x20]. [0x18] is the task pointer, not GPU VA.
 	uint64_t gpuVA   = mappedBufPtr ? getMember<uint64_t>(mappedBufPtr, 0x38) : 0;
 	bool safeForOriginal = mappedBufPtr && gpuVA != 0 && gpuBufSize >= 0xD040;
-	const bool shouldTryOriginal = allowOriginal && !skipOriginal && safeForOriginal;
+	const bool forceUnsafeOriginal = checkKernelArgument("-ngreenV69ForceOriginalUnsafe");
+	const bool shouldTryOriginal = allowOriginal && !skipOriginal && safeForOriginal &&
+		(NGreen::callback->isRealTGL || forceUnsafeOriginal);
 	if (shouldTryOriginal) {
 		SYSLOG("ngreen", "V111B: calling original Blit3D init (opt-in, fullMTL=%d allow=%d skip=%d base=0x%llx size=0x%llx)",
 		       forceFullMTL, allowOriginal, skipOriginal,
@@ -6287,6 +6567,9 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 		FunctionCast(IGHardwareBlit3DContextinitialize, callback->oIGHardwareBlit3DContextinitialize)(that);
 		SYSLOG("ngreen", "V111B: original Blit3D init completed");
 		return;
+	}
+	if (!NGreen::callback->isRealTGL && allowOriginal && !forceUnsafeOriginal) {
+		SYSLOG("ngreen", "V111B: -ngreenV69AllowOriginal blocked on spoofed RPL/ADL (use -ngreenV69ForceOriginalUnsafe only for crash debugging)");
 	}
 	if (allowOriginal && !safeForOriginal) {
 		SYSLOG("ngreen", "V106: -ngreenV69AllowOriginal requested but rejected (base=0x%llx size=0x%llx)",
@@ -6376,25 +6659,26 @@ uint8_t Gen11::blit3d_init_ctx(void *that)
 
 void  Gen11::initBlitUsage(void *that)
 {
-	// V121: On non-real-TGL, context+0xb8 may still be NULL on some init paths.
-	// The original initBlitUsage reads [ctx+0xb8]+0x178 without null checks → GPF.
-	// Called from IGAccelSegmentResourceList::prepare+0xf (Apple doesn't check return).
-	// On RPL spoof: just skip entirely; the blit usage counters at that+0x70/0x74
-	// remain zero, which is safe since no real blit 3D context is ever populated.
+	// V121: initBlitUsage reads [ctx+0xb8]+0x178 without null checks.
+	// Guard: skip if ctx+0xb8 is not yet populated (early init paths before
+	// blit3d_init_ctx has run). In the render phase ctx+0xb8 is always set.
 	if (!NGreen::callback->isRealTGL) {
-		DBGLOG("ngreen", "V121: initBlitUsage suppressed on RPL (no blit3D ctx)");
-		return;
+		if (!getMember<void *>(that, 0xb8)) {
+			DBGLOG("ngreen", "V121: initBlitUsage deferred — ctx+0xb8 null");
+			return;
+		}
 	}
 	FunctionCast(initBlitUsage, callback->oinitBlitUsage)(that);
 }
 void  Gen11::markBlitUsage(void *that)
 {
-	// V122: markBlitUsage + 0x17 dereferences [ctx+0xb8] without null checks.
-	// Called from prepare+0x2a right after initBlitUsage. On RPL spoof, ctx+0xb8
-	// can still be null on partial init paths → same page fault as V121.
+	// V122: markBlitUsage dereferences [ctx+0xb8] without null checks.
+	// Same guard as V121: skip only when ctx+0xb8 is not yet set.
 	if (!NGreen::callback->isRealTGL) {
-		DBGLOG("ngreen", "V122: markBlitUsage suppressed on RPL (no blit3D ctx)");
-		return;
+		if (!getMember<void *>(that, 0xb8)) {
+			DBGLOG("ngreen", "V122: markBlitUsage deferred — ctx+0xb8 null");
+			return;
+		}
 	}
 	FunctionCast(markBlitUsage, callback->omarkBlitUsage)(that);
 }
@@ -6408,20 +6692,33 @@ uint32_t  Gen11::IGAccelSegmentResourceListprepare(void *that)
 }
 
 uint32_t Gen11::beginCoalescedSegment(void *that) {
-	// V124: beginCoalescedSegment+0x2f reads [member+0xb8] without null check.
-	// On RPL spoof the Blit3D context may be missing on partial init paths,
-	// so the field is NULL → page fault CR2=0xb8.
-	// processAndSubmitCoalescedSegments calls this even when prepare returns 0.
+	// V124/IDA verified: beginCoalescedSegment is pure DTrace observability.
+	// Full disassembly:
+	//   [queue+0x830] = 0xFFFFFFFF           ← segment marker
+	//   task = *(*(queue+0x5C0)+0x150)
+	//   ctx  = getBlit3DContext(task, true)   ← may return null in early init
+	//   r15  = ctx+0xB8                       ← CRASH if ctx null or ctx+0xB8 null
+	//   r14  = r15+0x178                      ← usage counter
+	//   dtracePushUnique(queue+0x5C0+0xE08, queue+0x838)
+	//   dtHookSubmitQueueKMD(queue+0x838, 4, r14+1, r15+0x20, 0, 0)
+	// No GPU ring submission whatsoever.
+	//
+	// Always write queue+0x830 first (matches Apple's implementation).
+	reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(that) + 0x830)[0] = 0xFFFFFFFF;
+
 	if (!NGreen::callback->isRealTGL) {
-		// Mirror the first write in Apple's implementation to keep queue state coherent
-		// for callers that poll this field during segment lifecycle.
-		static int v124CallCount = 0;
-		v124CallCount++;
-		reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(that) + 0x830)[0] = 0xFFFFFFFF;
-		if (v124CallCount <= 50 || v124CallCount % 100 == 0) {
-			SYSLOG("ngreen", "V124[%d]: beginCoalescedSegment bypassed on RPL (state primed) queue=%p", v124CallCount, that);
+		// Guard: ctx+0xB8 must be non-null before calling through (DTrace reads it).
+		// In early init getBlit3DContext returns null → skip DTrace, return 1.
+		// In render phase ctx+0xB8 is always populated → call through for correct tracing.
+		void *cached = callback->v131CachedBlit3DCtx;
+		if (!cached || !getMember<void *>(cached, 0xb8)) {
+			static int v124EarlyCount = 0;
+			if (v124EarlyCount < 8) {
+				v124EarlyCount++;
+				DBGLOG("ngreen", "V124[%d]: beginCoalescedSegment deferred — ctx+0xb8 null", v124EarlyCount);
+			}
+			return 1;
 		}
-		return 1;
 	}
 	return FunctionCast(beginCoalescedSegment, callback->obeginCoalescedSegment)(that);
 }
@@ -6511,13 +6808,30 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 
 void Gen11::blit3d_initialize_scratch_space(void *that)
 {
-	// V181: On !isRealTGL the scratch buffer's CPU mapping (returned by getMemory()) is
-	// read-only — writing 0x44 bytes of TGL shader kernels to buf+0xD000 causes a write
-	// page fault (error code 0x2, CR2=buf+0xD000). Skip entirely on spoofed paths.
-	// The original initialize() is now safe to call because this is the only crashing step.
-	if (!NGreen::callback->isRealTGL) {
-		DBGLOG("ngreen", "V181: blit3d_initialize_scratch_space suppressed on RPL");
+	// Real TGL: always use Apple's original path unchanged.
+	if (NGreen::callback->isRealTGL) {
+		FunctionCast(blit3d_initialize_scratch_space, callback->oblit3d_initialize_scratch_space)(that);
 		return;
+	}
+
+	// V181: On spoofed paths, allow scratch init now that IOAF2 lock/unlock symbols
+	// are resolved. The scratch buffer must be populated for RCS (routeSel=3) blits
+	// to execute correctly; without it the GPU stalls on null shader code (Sig 813).
+	// Guard: only proceed if IOAF2 symbols resolved — if they're missing, suppressing
+	// is safer than a GPU hang.
+	if (!callback->oIOAF2_lockForCPUAccess || !callback->oIOAF2_unlockForCPUAccess) {
+		SYSLOG("ngreen", "V181: suppressing scratch init on RPL — IOAF2 symbols unresolved lock=%p unlock=%p",
+		       reinterpret_cast<void *>(callback->oIOAF2_lockForCPUAccess),
+		       reinterpret_cast<void *>(callback->oIOAF2_unlockForCPUAccess));
+		return;
+	}
+
+	static bool v181InitLogged = false;
+	if (!v181InitLogged) {
+		v181InitLogged = true;
+		SYSLOG("ngreen", "V181: blit3d_initialize_scratch_space running on RPL (IOAF2 lock=%p unlock=%p)",
+		       reinterpret_cast<void *>(callback->oIOAF2_lockForCPUAccess),
+		       reinterpret_cast<void *>(callback->oIOAF2_unlockForCPUAccess));
 	}
 	FunctionCast(blit3d_initialize_scratch_space, callback->oblit3d_initialize_scratch_space)(that);
 }

@@ -376,7 +376,23 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			patcher.clearError();
 			SYSLOG("NGreen", "IOAccelF2: IGAccelDevice::deviceStart symbol not found");
 		}
-		
+
+		// V181: resolve lockForCPUAccess / unlockForCPUAccess for Gen11 blit3d scratch init
+		if (Gen11::callback) {
+			SolveRequestPlus ioaf2Solve[] = {
+				{"__ZN16IOAccelSysMemory16lockForCPUAccessEP4taskj", Gen11::callback->oIOAF2_lockForCPUAccess},
+				{"__ZN16IOAccelSysMemory18unlockForCPUAccessEP4task", Gen11::callback->oIOAF2_unlockForCPUAccess},
+			};
+			if (SolveRequestPlus::solveAll(patcher, index, ioaf2Solve, address, size)) {
+				SYSLOG("ngreen", "V181: IOAF2 lock/unlock resolved lock=%p unlock=%p",
+				       reinterpret_cast<void *>(Gen11::callback->oIOAF2_lockForCPUAccess),
+				       reinterpret_cast<void *>(Gen11::callback->oIOAF2_unlockForCPUAccess));
+			} else {
+				patcher.clearError();
+				SYSLOG("ngreen", "V181: IOAF2 lock/unlock resolve failed");
+			}
+		}
+
 	}  else if (kextIOGraphics.loadIndex == index) {
 		/*
 		KernelPatcher::RouteRequest requests[] = {

@@ -1638,7 +1638,7 @@ private:
 	
 	static void blit3d_initialize_scratch_space(void *that);
 	mach_vm_address_t oblit3d_initialize_scratch_space {};
-	
+
 	// Extended GPU context init — sets up additional context state (PPGTT, aux tables)
 	static uint8_t	IGHardwareExtendedContextinitWithOptions
 			  (void *that,void *param_1,
@@ -1772,6 +1772,10 @@ private:
 	mach_vm_address_t oprepareToEnterWake {};
 	
 public:
+
+	// Resolved from IOAcceleratorFamily2 by NGreen::processKext — needed by blit3d scratch init.
+	mach_vm_address_t oIOAF2_lockForCPUAccess {};
+	mach_vm_address_t oIOAF2_unlockForCPUAccess {};
 
 	void init();  // register kextInfos with Lilu
 	static Gen11 *callback;  // singleton for Lilu static callbacks
