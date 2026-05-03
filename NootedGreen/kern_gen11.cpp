@@ -50,10 +50,6 @@ static KernelPatcher::KextInfo kextG11HWTA {"com.apple.driver.AppleIntelTGLGraph
 	{false, false, false, true}, {},
 	KernelPatcher::KextInfo::Unloaded};
 
-// IOAcceleratorFamily2 symbols are resolved inside NGreen::processKext via
-// kextIOAcceleratorFamily2 (kern_green.cpp) which already has the valid path.
-// No separate kextIOAF2 registration needed here.
-
 Gen11 *Gen11::callback = nullptr;
 
 void Gen11::init() {
@@ -83,30 +79,6 @@ static bool isExperimentalMonitorEnabled() {
 	}
 
 	return checkKernelArgument("-ngreenexp");
-}
-
-static bool isV60MonitorEnabled() {
-	int forceOff = 0;
-	if (PE_parse_boot_argn("ngreenv60off", &forceOff, sizeof(forceOff))) {
-		if (forceOff != 0)
-			return false;
-	}
-
-	if (checkKernelArgument("-ngreenv60off")) {
-		return false;
-	}
-
-	int forceOn = 0;
-	if (PE_parse_boot_argn("ngreenv60", &forceOn, sizeof(forceOn))) {
-		if (forceOn != 0)
-			return true;
-	}
-
-	if (checkKernelArgument("-ngreenv60")) {
-		return true;
-	}
-
-	return isExperimentalMonitorEnabled();
 }
 
 static bool isLegacyOwnershipModeEnabled() {
@@ -167,6 +139,15 @@ static bool isV93PlaneGuardEnabled() {
 	return checkKernelArgument("-ngreenv93");
 }
 
+static bool isReferenceF2ProbeEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenRefProbeF2", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenRefProbeF2");
+}
+
 static bool shouldForceFullMetalPath() {
 	int enabled = 0;
 	if (PE_parse_boot_argn("ngreenfullmtlcore", &enabled, sizeof(enabled))) {
@@ -208,15 +189,6 @@ static int getV142SubmitBlitMode() {
 	return 1;
 }
 
-static bool isV142Diag2DBypassEnabled() {
-	int enabled = 0;
-	if (PE_parse_boot_argn("ngreenV142diag2d", &enabled, sizeof(enabled))) {
-		return enabled != 0;
-	}
-
-	return checkKernelArgument("-ngreenV142diag2d");
-}
-
 static bool isV88ScanoutFillEnabled() {
 	int enabled = 0;
 	if (PE_parse_boot_argn("ngreenv88", &enabled, sizeof(enabled))) {
@@ -224,37 +196,6 @@ static bool isV88ScanoutFillEnabled() {
 	}
 
 	return checkKernelArgument("-ngreenv88");
-}
-
-static bool isV60AggressiveMonitorEnabled() {
-	int enabled = 0;
-	if (PE_parse_boot_argn("ngreenv60rw", &enabled, sizeof(enabled))) {
-		return enabled != 0;
-	}
-
-	return checkKernelArgument("-ngreenv60rw");
-}
-
-static bool isV80LEnforcerEnabled() {
-	return checkKernelArgument("-ngreenv80l");
-}
-
-static uint32_t getV65Tier1WantBits(bool isRealTGL) {
-	// Real TGL: always use native behavior (RCS + BCS).
-	if (isRealTGL) {
-		return (1u << GEN11_RCS0) | (1u << GEN11_BCS);
-	}
-
-	// RPL/ADL spoof path: BCS must be enabled when the original submitBlit path
-	// (V142 mode 3) is active — that path submits directly to BCS ring. Leaving
-	// BCS out of the want bits means RING_CTRL never gets the enable bit set,
-	// commands queue up and the ring stalls (gpuRestart Signature 801).
-	// For other V142 modes (0/1/2 = bypass/return0) BCS is idle, keep RCS-only.
-	if (getV142SubmitBlitMode() == 3 || checkKernelArgument("-ngreenbcsirq")) {
-		return (1u << GEN11_RCS0) | (1u << GEN11_BCS);
-	}
-
-	return (1u << GEN11_RCS0);
 }
 
 static int getV77KillDelayIterations() {
@@ -271,7 +212,17 @@ static int getV77KillDelayIterations() {
 	return 60;
 }
 
+static bool isV142Diag2DBypassEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenV142diag2d", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenV142diag2d");
+}
+
 bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	
 	if (kextG11FB.loadIndex == index) {
 		if (this->tglFBLoaded) {
 			DBGLOG("ngreen", "Skipping ICL FB — TGL FB already loaded");
@@ -715,6 +666,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesp , address, size), "ngreen", "kextG11FBT Failed to apply production patches!");
 		}
 		else {
+			const bool refProbeF2 = isReferenceF2ProbeEnabled();
 			LookupPatchPlus const patches[] = {// tgl debug kext
 				{activeKext, f1, r1, arrsize(f1),	1},
 				// f2 (osinfo pipe/port/fb counts) disabled: wrong counts can corrupt scanout layout
@@ -752,6 +704,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11FBT Failed to apply dbg patches!");
 
+			if (refProbeF2 && !NGreen::callback->isRealTGL) {
 				// Reference probe: enable only old f2 topology/osinfo bypass on demand.
 				// Keeps current stability protections while testing whether f2 is the flash trigger.
 				LookupPatchPlus const probeF2Patch[] = {
@@ -760,6 +713,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				PANIC_COND(!LookupPatchPlus::applyAll(patcher, probeF2Patch, address, size),
 					"ngreen", "kextG11FBT Failed to apply reference f2 probe patch!");
 				SYSLOG("ngreen", "V109: reference probe enabled (f2 osinfo patch active)");
+			} else if (refProbeF2) {
+				SYSLOG("ngreen", "V109: reference f2 probe requested but ignored on real TGL");
+			}
 		}
 		
 		return true;
@@ -981,9 +937,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			 // We route it only to scope temporary getter fallback (no broad bypass).
 			 {"__Z17barrierSubmissionR19IGAccelCommandQueueR16IntelAcceleratorR24IGAccelCommandDescriptorR12IOAccelEventtPKt", barrierSubmission, this->obarrierSubmission},
 			 
-			 // V117: Hook getBlit2DContext for null-guarding only.
-			 // submitBlit expects a real Blit2D context layout and unconditionally reads
-			 // [ctx+0xb8], so we must never substitute depth/color/3D context objects here.
+			 // V117: Hook getBlit2DContext — on RPL, BCS ring was never started (CTL=0x0).
+			 // Apple's original creates a Blit2D context and submits it to BCS, whose ring ring
+			 // buffer contains zeros → GPU hang → reset. Return null to suppress BCS usage.
 			 {"__ZN11IGAccelTask16getBlit2DContextEb", getBlit2DContext, this->ogetBlit2DContext},
 
 			 // Resolve-context getters are used by barrierSubmission and are generally safe.
@@ -996,6 +952,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		SYSLOG("ngreen", "V165: HW accelerator symbols routed OK");
 
 		{
+			// Route IntelAccelerator::start when available so Gen11::start diagnostics run.
+			// Keep this non-fatal because symbol names vary between Sonoma builds.
 			RouteRequestPlus startRoute[] = {
 				{"__ZN16IntelAccelerator5startEP9IOService", start, this->ostart},
 			};
@@ -1698,6 +1656,7 @@ bool  Gen11::getGPUInfo(void *that)
 	
 	auto ret=FunctionCast(getGPUInfo, callback->ogetGPUInfo)(that);
 	const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
+	const bool forceFullMTL = shouldForceFullMetalPath();
 	
 	// --- GPU topology override for RPL i7-13700H (verified from Linux i915 syslog) ---
 	// Linux i915 reports: 1 slice, 6 DSS (mask=0x3f), 16 EU/DSS, 96 EU total.
@@ -1729,11 +1688,11 @@ bool  Gen11::getGPUInfo(void *that)
 	SYSLOG("ngreen", "getGPUInfo: overridden topology → slices=%u subslices=%u maxEU/SS=%u totalEU=%u L3Banks=8",
 		   numSlices, numSubSlices, maxEUPerSubSlice, totalEU);
 
-	// On spoofed platforms, do not propagate a false return from the original path,
-	// otherwise accelerator bring-up may abort and cursor/WindowServer init can stall.
-	// Keep real TGL behavior unchanged.
-	if (!isRealTGL && !ret) {
-		SYSLOG("ngreen", "getGPUInfo: forcing success on spoofed CPU (ret=false)");
+	// On spoofed platforms in full-MTL mode, do not propagate a false return from
+	// the original path, otherwise accelerator bring-up may abort and CoreDisplay
+	// later receives a null Metal object in RunFullDisplayPipe.
+	if (!isRealTGL && forceFullMTL && !ret) {
+		SYSLOG("ngreen", "getGPUInfo: forcing success on spoofed CPU in full-MTL mode");
 		return true;
 	}
 
@@ -2213,9 +2172,7 @@ static void v45DelayedChildCheck(thread_call_param_t p0, thread_call_param_t p1)
 				if (delayMs >= 3000) {
 					const char *childName = child->getName();
 					if (childName && (strcmp(childName, "IGAccelDevice") == 0 ||
-									  strcmp(childName, "IGAccelSharedUserClient") == 0 ||
-									  strcmp(childName, "IOAccelDisplayPipeUserClient2") == 0 ||
-									  strcmp(childName, "IGAccelCommandQueue") == 0)) {
+									  strcmp(childName, "IGAccelSharedUserClient") == 0)) {
 						// Dump child's provider and property state
 						auto *childProvider = child->getProvider();
 						SYSLOG("ngreen", "V55: %s state=0x%llx provider=%s isOpen=%d",
@@ -2429,53 +2386,6 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	}
 	*/
 
-	const bool v60Aggressive = isV60AggressiveMonitorEnabled();
-	if (v60Count == 1) {
-		SYSLOG("ngreen", "V60: monitor mode=%s (enable -ngreenv60rw for active register writes)",
-			   v60Aggressive ? "aggressive" : "read-only");
-	}
-
-	// 5. V60: error suppression path. Default is read-only for stability.
-	// Use -ngreenv60rw to enable active register writes during monitor ticks.
-	/*if (v60Aggressive) {
-		if (realErr) {
-			NGreen::callback->writeReg32(ERROR_GEN6, 0x0);
-		}
-		// Re-mask EMR every cycle — Apple may unmask during error recovery attempts
-		if (emr != 0xFFFFFFFF) {
-			NGreen::callback->writeReg32(RING_EMR(RENDER_RING_BASE), 0xFFFFFFFF);
-		}
-		
-		// ── V79: Plane linearization (brief Apple logo flash) — aggressive mode only ──
-		// Boot log shows SURF=0x0 for iters 1–6; SURF becomes non-zero (tiled) at iter 7 (~14s).
-		// Old cadence (<=5, 10, 20, 30) skipped iter 7/8/9 — the first 6s window where the plane
-		// is tiled. Writing at iter 10 (~20s) is too late: the login screen is already up and the
-		// Apple logo phase has ended. Fix: fire every tick from 1–12 so we catch iter 7 immediately
-		// (first time SURF is mapped and tiling != 0) while the Apple logo may still be on screen.
-		if (v60Count <= 12 || v60Count == 20 || v60Count == 30) {
-			uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
-			uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
-			uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
-			if (tiling != 0) {
-				uint32_t newCtl = planCtl & ~(0x7u << 10); // clear tiling -> linear
-				uint32_t newStrd = planStrd;
-				if (tiling == 1) {
-					newStrd = planStrd * 8;
-				} else if (tiling == 4) {
-					newStrd = planStrd * 16;
-				}
-				NGreen::callback->writeReg32(0x70180, newCtl);
-				NGreen::callback->writeReg32(0x70188, newStrd);
-				uint32_t planSurf = NGreen::callback->readReg32(0x7019C);
-				NGreen::callback->writeReg32(0x7019C, planSurf);
-				SYSLOG("ngreen", "V79[%d]: tiling %d->linear CTL 0x%x->0x%x STRIDE 0x%x->0x%x SURF=0x%x",
-						   v60Count, tiling, planCtl, newCtl, planStrd, newStrd, planSurf);
-			} else {
-				SYSLOG("ngreen", "V79[%d]: already linear CTL=0x%x STRIDE=0x%x", v60Count, planCtl, planStrd);
-			}
-		}
-	}*/
-
 	// 5. V60: ACTIVE error suppression (V57 proven approach)
 	//    Clear ERROR_GEN6 by writing 0x0, re-mask EMR every cycle
 	if (realErr) {
@@ -2548,15 +2458,12 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 				}
 				
 				// V68: Clear sched error EARLY (don't wait for iteration 5)
-				// This mutates live scheduler memory; keep disabled in read-only mode.
 				uint32_t schedErr = *reinterpret_cast<uint32_t *>(schedBase + 0x0C);
-				if (schedErr && v60Aggressive) {
+				if (schedErr) {
 					*reinterpret_cast<uint32_t *>(schedBase + 0x0C) = 0;
 					*reinterpret_cast<uint32_t *>(schedBase + 0x00) = 0;
 					SYSLOG("ngreen", "V68: early sched clear err=0x%x->0x%x flag=0x0",
 						schedErr, *reinterpret_cast<uint32_t *>(schedBase + 0x0C));
-				} else if (schedErr) {
-					SYSLOG("ngreen", "V68: sched err=0x%x observed (read-only mode, not clearing)", schedErr);
 				}
 			} else {
 				SYSLOG("ngreen", "V67: scheduler ptr is NULL!");
@@ -2673,48 +2580,18 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		uint32_t writeIdx = (csbPtrNow >> 8) & 0x7;
 		uint32_t readIdx  = csbPtrNow & 0x7;
 		SYSLOG("ngreen", "V64: CSB ptr=0x%x write=%d read=%d", csbPtrNow, writeIdx, readIdx);
-		if (writeIdx != readIdx && v60Aggressive) {
+		if (writeIdx != readIdx) {
 			// Advance read pointer to match write pointer
 			uint32_t newPtr = (csbPtrNow & ~0x7) | (writeIdx & 0x7);
 			NGreen::callback->writeReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE), newPtr);
 			uint32_t verify = NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
 			SYSLOG("ngreen", "V64: CSB read ptr advanced %d->%d (wrote 0x%x, readback 0x%x)",
 				   readIdx, writeIdx, newPtr, verify);
-		} else if (writeIdx != readIdx) {
-			SYSLOG("ngreen", "V64: read-only mode (use -ngreenv60rw to advance CSB read ptr)");
 		} else {
 			SYSLOG("ngreen", "V64: CSB ptrs already matched (write=read=%d)", writeIdx);
 		}
 	}
 	
-	// V65: Enforce RCS0 interrupt enable on EVERY iteration (moved from V64 iteration 5).
-	// V64 proved the fix at T+10s was too late — scheduler already gave up.
-	// Now combined with V65 pre-start + V65W watchdog fixes for full coverage.
-	/*if (v60Aggressive) {
-		uint32_t rcIntrEn = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
-		uint32_t rcsMask  = NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK);
-		
-		// Tier-1 IRQ policy: RCS only on spoofed non-TGL by default.
-		uint32_t wantBits = getV65Tier1WantBits(NGreen::callback->isRealTGL);
-		if ((rcIntrEn & wantBits) != wantBits) {
-			uint32_t newEn = rcIntrEn | wantBits;
-			NGreen::callback->writeReg32(GEN11_RENDER_COPY_INTR_ENABLE, newEn);
-			if (v60Count <= 3) {
-				SYSLOG("ngreen", "V65M[%d]: tier-1 fix 0x%x->0x%x", v60Count, rcIntrEn,
-					NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE));
-			}
-		}
-		// Unmask context-switch + user interrupt for RCS (0 = unmasked, 1 = masked)
-		uint32_t wantUnmasked = GT_CONTEXT_SWITCH_INTERRUPT | GT_RENDER_USER_INTERRUPT;
-		if (rcsMask & wantUnmasked) {
-			uint32_t newMask = rcsMask & ~wantUnmasked;
-			NGreen::callback->writeReg32(GEN11_RCS0_RSVD_INTR_MASK, newMask);
-			if (v60Count <= 3) {
-				SYSLOG("ngreen", "V65M[%d]: tier-2 fix mask 0x%x->0x%x", v60Count, rcsMask, newMask);
-			}
-		}
-	}*/
-
 	// V65: Enforce RCS0 interrupt enable on EVERY iteration (moved from V64 iteration 5).
 	// V64 proved the fix at T+10s was too late — scheduler already gave up.
 	// Now combined with V65 pre-start + V65W watchdog fixes for full coverage.
@@ -2743,23 +2620,6 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 	
-	// ── V79: Plane monitor (strictly read-only) ──
-	// Any plane-format writes here have caused either WS crash loops or WS hangs.
-	// Keep this path logging-only; never modify PLANE_CTL/STRIDE/SURF in V60.
-	/*{
-		uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
-		uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
-		uint32_t planSurf = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
-		uint32_t planSize = NGreen::callback->readReg32(0x70190); // PLANE_SIZE
-		uint32_t planPos  = NGreen::callback->readReg32(0x7018C); // PLANE_POS
-		uint32_t pipeConf = NGreen::callback->readReg32(0x70008); // PIPE_CONF_A
-		uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
-
-		// Always log plane state for diagnostics
-		SYSLOG("ngreen", "V79[%d]: PIPE=0x%x CTL=0x%x STRIDE=0x%x SURF=0x%x SIZE=0x%x POS=0x%x tiling=%d",
-			   v60Count, pipeConf, planCtl, planStrd, planSurf, planSize, planPos, tiling);
-	}*/
-
 	// ── V79: Plane monitor / experimental linearization ──
 	// The old copy only reached brief first-light when the experimental path forced
 	// the scanout plane to linear and re-armed PLANE_SURF. Keep the default path
@@ -2886,25 +2746,16 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		SYSLOG("ngreen", "V76[%d]: PSR_CTL=0x%x PSR_STATUS=0x%x PSR2_CTL=0x%x",
 			   v60Count, psrCtl, psrSts, psrCtl2);
 
-		// 5. Gamma LUT sample — if gamma table is zeroed, all output = black.
-		// In read-only mode keep current index untouched and only sample current entry.
+		// 5. Gamma LUT sample — if gamma table is zeroed, all output = black
+		// Read PREC_PAL_INDEX_A, set index, read data
 		uint32_t gammaIdx = NGreen::callback->readReg32(0x4A400); // PREC_PAL_INDEX_A
-		uint32_t gamma0 = 0;
-		uint32_t gamma128 = 0;
-		uint32_t gamma255 = 0;
-		if (v60Aggressive) {
-			NGreen::callback->writeReg32(0x4A400, 0);                 // Set index to 0
-			gamma0 = NGreen::callback->readReg32(0x4A404);            // PREC_PAL_DATA_A
-			NGreen::callback->writeReg32(0x4A400, 128);               // Mid-range index
-			gamma128 = NGreen::callback->readReg32(0x4A404);
-			NGreen::callback->writeReg32(0x4A400, 255);               // Near max index
-			gamma255 = NGreen::callback->readReg32(0x4A404);
-			NGreen::callback->writeReg32(0x4A400, gammaIdx);          // Restore original index
-		} else {
-			gamma0 = NGreen::callback->readReg32(0x4A404);
-			gamma128 = gamma0;
-			gamma255 = gamma0;
-		}
+		NGreen::callback->writeReg32(0x4A400, 0);                 // Set index to 0
+		uint32_t gamma0 = NGreen::callback->readReg32(0x4A404);   // PREC_PAL_DATA_A
+		NGreen::callback->writeReg32(0x4A400, 128);                // Mid-range index
+		uint32_t gamma128 = NGreen::callback->readReg32(0x4A404);
+		NGreen::callback->writeReg32(0x4A400, 255);                // Near max index
+		uint32_t gamma255 = NGreen::callback->readReg32(0x4A404);
+		NGreen::callback->writeReg32(0x4A400, gammaIdx);           // Restore original index
 		SYSLOG("ngreen", "V76[%d]: GAMMA idx_was=0x%x g[0]=0x%x g[128]=0x%x g[255]=0x%x",
 			   v60Count, gammaIdx, gamma0, gamma128, gamma255);
 
@@ -3160,25 +3011,10 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	}
 }
 
-// V74: Permanent EMR + GGTT enforcer — fires every 50ms for the lifetime of the GPU.
-//
-// WHY: On RPL/ADL spoofed as TGL, Apple's AppleIntelTGLGraphics continuously re-writes
-// RING_EMR (Error Mask Register) for RCS and BCS back to a non-full-mask value, and also
-// re-maps GGTT[0] to the stolen-memory base. Both are fatal:
-//   - Un-masked EMR causes the GPU error interrupt to fire on every submitted command,
-//     preventing the display pipe from ever activating (all-black screen).
-//   - GGTT[0] → stolen mem causes a package-wide MCE if any GPU VA-0 access occurs.
-//
-// HOW: Apple writes EMR via direct GT MMIO (not through the hookable WriteRegister32
-// vtable), so we cannot intercept it. Instead we poll every 50ms and correct any
-// deviation. The timer re-arms itself indefinitely; it stops only if MMIO becomes
-// invalid (GPU teardown). Each timer instance holds a retain on the IOService and
-// transfers it to the next allocation to avoid UAF.
-//
-// WHAT it does each tick:
-//   1. Force RING_EMR(RCS) and RING_EMR(BCS) to 0xFFFFFFFF (all errors masked).
-//   2. Clear ERROR_GEN6 if non-zero.
-//   3. Re-enforce GGTT[0] → safe wired dummy page (V116, see below).
+// V74: Permanent EMR enforcer — runs every 50ms INDEFINITELY.
+// V71 proved this works during its 30s window but device dies the moment it stops.
+// V72 proved Apple writes EMR via direct MMIO, not through hookable WriteRegister32.
+// Solution: never stop the timer. Log rate-limited to avoid filling buffer.
 void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param1) {
 	static int v71Count = 0;
 	v71Count++;
@@ -3196,57 +3032,20 @@ void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param
 	if (err)
 		NGreen::callback->writeReg32(ERROR_GEN6, 0x0);
 
-	// 3. Log first 3 + unmask events (rate-limited)
+	// 3. Log first 3 + unmask events (rate-limited: first 200 only)
 	if (v71Count <= 3 || (emrRcs != 0xFFFFFFFF && v71Count <= 10)) {
 		SYSLOG("ngreen", "V74E[%d]: EMR_RCS=0x%x EMR_BCS=0x%x ERR=0x%x",
 			   v71Count, emrRcs, emrBcs, err);
 	}
 
-	// V80 legacy ownership mode: one-shot plane linearization at early boot.
-	// Runs only during the first 3 ticks (≤150ms after start) — this produces the
-	// brief display flash that was present before the start hook was active.
-	// After tick 3 WS has composited its first frame and owns those registers;
-	// continuing to write them causes WS crash-loop → watchdog KP at T+120s.
-	// -ngreenv80l overrides to run continuously (for isolated plane-write testing only).
-	if (!NGreen::callback->isRealTGL && isLegacyOwnershipModeEnabled() &&
-	    (v71Count <= 3 || isV80LEnforcerEnabled())) {
-		uint32_t planCtl = NGreen::callback->readReg32(0x70180); // PLANE_CTL
-		bool planeEnabled = !!(planCtl & 0x80000000u);
-		if (planeEnabled) {
-			uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
-			uint32_t planSurf = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
-			uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
-			if (planSurf != 0 && tiling != 0) {
-				uint32_t newCtl = planCtl & ~(0x7u << 10); // clear tiling -> linear
-				uint32_t newStrd = planStrd;
-				if (tiling == 1) {
-					newStrd = planStrd * 8;
-				} else if (tiling == 4) {
-					newStrd = planStrd * 16;
-				}
-				NGreen::callback->writeReg32(0x70180, newCtl);
-				NGreen::callback->writeReg32(0x70188, newStrd);
-				NGreen::callback->writeReg32(0x7019C, planSurf);
-				if (v71Count <= 20 || (v71Count % 20) == 0) {
-					SYSLOG("ngreen", "V80L[%d]: tiling %u->linear CTL 0x%x->0x%x STRIDE 0x%x->0x%x SURF=0x%x",
-						   v71Count, tiling, planCtl, newCtl, planStrd, newStrd, planSurf);
-				}
-			} else if (planSurf != 0) {
-				NGreen::callback->writeReg32(0x7019C, planSurf);
-				if (v71Count <= 20 || (v71Count % 20) == 0) {
-					SYSLOG("ngreen", "V80L[%d]: already linear, SURF re-arm=0x%x", v71Count, planSurf);
-				}
-			}
-		}
-	}
+	// Display-state forcing experiments (V80/V88/V89/V90) are disabled.
+	// They were useful for isolation while the system booted in headless mode,
+	// but now that OpenCore injects the framebuffer ID early, let the native
+	// Apple display pipeline own plane/scaler/cursor/PSR state.
 
-	// V116: Re-enforce GGTT[0] → safe wired dummy page every 50ms.
-	// Apple's TGL framebuffer driver re-writes GGTT[0] to the stolen-memory physical base
-	// during its internal GTT setup. Any GPU command that dereferences VA 0x0 then hits
-	// stolen memory, triggering an uncorrectable MCE (machine check exception) that kills
-	// the whole package. We restore GGTT[0] to a wired zero-page (allocated at start) on
-	// every enforcer tick so the stolen-mem mapping can never persist.
-	// PTE flags: bits[11:0]=0x9 → present | global (TGL/ICL GTT format, no cache attrs).
+	// V116: Re-enforce GGTT[0] → safe dummy page every 50ms.
+	// Apple's driver may re-write GGTT[0] → stolen mem base, causing package-wide MCE.
+	// We override it back every EMR iteration so the stolen-mem mapping can never stick.
 	if (v116DummyPhys) {
 		uint32_t wantLo = (uint32_t)(v116DummyPhys & 0xFFFFF000ULL) | 0x9;
 		uint32_t cur0Lo = NGreen::callback->readReg32(GGTT_PTE_LO(0));
@@ -3317,7 +3116,7 @@ void Gen11::v54IrqWatchdog(thread_call_param_t param0, thread_call_param_t) {
 	// The ring activates between V54W[4]-V54W[5] (T+8-10s) — we must have this set BEFORE.
 	{
 		uint32_t rcIntrEn = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
-		uint32_t wantBits = getV65Tier1WantBits(NGreen::callback->isRealTGL);
+		uint32_t wantBits = (1 << GEN11_RCS0) | (1 << GEN11_BCS);
 		bool rcsOk = !!(rcIntrEn & (1 << GEN11_RCS0));
 		if (!rcsOk) {
 			uint32_t newEn = rcIntrEn | wantBits;
@@ -3365,7 +3164,9 @@ void Gen11::v54IrqWatchdog(thread_call_param_t param0, thread_call_param_t) {
 		SYSLOG("ngreen", "V54W: watchdog complete after %d iterations", v54WatchdogCount);
 	}
 }
-// V44: Bundle/property logging helper — logs Metal/GL/VA bundle names after a delay.
+
+// V44: Bundle/property logging disabled — commented out to reduce boot-time overhead.
+#if 0
 static const char *v44SafeCString(OSString *str) {
     if (!str) {
         return "MISSING";
@@ -3416,6 +3217,7 @@ static void v44ScheduleBundleLog(void *accelInstance, unsigned delayMs) {
         svc->release();
     }
 }
+#endif
 
 bool Gen11::start(void *that,void  *param_1)
 {
@@ -3603,7 +3405,7 @@ bool Gen11::start(void *that,void  *param_1)
 		// causing scheduler to never receive completion interrupts → timeout → dead engine.
 		// Must be set BEFORE ring activates (T+8-10s) to prevent scheduler timeout.
 		uint32_t rcIntrPre = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
-		uint32_t wantBits = getV65Tier1WantBits(NGreen::callback->isRealTGL);
+		uint32_t wantBits = (1 << GEN11_RCS0) | (1 << GEN11_BCS);
 		uint32_t newEn = rcIntrPre | wantBits;
 		NGreen::callback->writeReg32(GEN11_RENDER_COPY_INTR_ENABLE, newEn);
 		// Also unmask RCS context-switch + user interrupts at tier-2
@@ -3620,8 +3422,7 @@ bool Gen11::start(void *that,void  *param_1)
 	
 	// V54: Schedule IRQ watchdog timer — re-enables Master IRQ every 2s during start().
 	// The driver's interrupt setup may disable it during init; we keep re-enabling.
-	// Real TGL keeps native behavior; spoof path always needs this.
-	if (!NGreen::callback->isRealTGL) {
+	{
 		auto timerCall = thread_call_allocate(v54IrqWatchdog, nullptr);
 		if (timerCall) {
 			uint64_t deadline;
@@ -3636,37 +3437,34 @@ bool Gen11::start(void *that,void  *param_1)
 	// GGTT[0] PTE points to stolen memory base. Any GPU access to VA=0
 	// (ring buffer at addr 0, PLANE_SURF=0, etc.) reads stolen mem → LLC UCE → MCE.
 	// Fix: redirect GGTT[0] to a wired zero-page so stray VA-0 reads are harmless.
-	// Real TGL keeps native GGTT mapping; spoof path needs this MCE guard.
-	if (!NGreen::callback->isRealTGL) {
-		if (!v116DummyBuf) {
-			v116DummyBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-				kernel_task,
-				kIOMemoryPhysicallyContiguous | kIODirectionInOut,
-				4096,
-				0x00000000FFFFF000ULL);  // keep below 4GB for 32-bit GGTT addressing
-			if (v116DummyBuf && v116DummyBuf->prepare() == kIOReturnSuccess) {
-				v116DummyPhys = v116DummyBuf->getPhysicalAddress();
-				auto *m = v116DummyBuf->createMappingInTask(kernel_task, 0, kIOMapAnywhere, 0, 4096);
-				if (m) { bzero((void *)m->getVirtualAddress(), 4096); m->release(); }
-				SYSLOG("ngreen", "V116: dummy page allocated phys=0x%llx",
-					   (unsigned long long)v116DummyPhys);
-			} else {
-				OSSafeReleaseNULL(v116DummyBuf);
-				SYSLOG("ngreen", "V116: dummy page alloc/prepare FAILED");
-			}
+	if (!v116DummyBuf) {
+		v116DummyBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+			kernel_task,
+			kIOMemoryPhysicallyContiguous | kIODirectionInOut,
+			4096,
+			0x00000000FFFFF000ULL);  // keep below 4GB for 32-bit GGTT addressing
+		if (v116DummyBuf && v116DummyBuf->prepare() == kIOReturnSuccess) {
+			v116DummyPhys = v116DummyBuf->getPhysicalAddress();
+			auto *m = v116DummyBuf->createMappingInTask(kernel_task, 0, kIOMapAnywhere, 0, 4096);
+			if (m) { bzero((void *)m->getVirtualAddress(), 4096); m->release(); }
+			SYSLOG("ngreen", "V116: dummy page allocated phys=0x%llx",
+				   (unsigned long long)v116DummyPhys);
+		} else {
+			OSSafeReleaseNULL(v116DummyBuf);
+			SYSLOG("ngreen", "V116: dummy page alloc/prepare FAILED");
 		}
-		if (v116DummyPhys && NGreen::callback->mmioValid()) {
-			// PTE format (Gen8+): bits[47:12]=phys PFN, bit[3]=LLC-coherent, bit[0]=present
-			uint32_t pteLo = (uint32_t)(v116DummyPhys & 0xFFFFF000ULL) | 0x9;  // LLC | present
-			uint32_t pteHi = (uint32_t)(v116DummyPhys >> 32);
-			uint32_t oldLo = NGreen::callback->readReg32(GGTT_PTE_LO(0));
-			uint32_t oldHi = NGreen::callback->readReg32(GGTT_PTE_HI(0));
-			NGreen::callback->writeReg32(GGTT_PTE_LO(0), pteLo);
-			NGreen::callback->writeReg32(GGTT_PTE_HI(0), pteHi);
-			NGreen::callback->writeReg32(0x101008, 0x1);  // GGTT TLB flush
-			SYSLOG("ngreen", "V116: GGTT[0] 0x%08x:%08x -> 0x%08x:%08x (dummy phys=0x%llx)",
-				   oldHi, oldLo, pteHi, pteLo, (unsigned long long)v116DummyPhys);
-		}
+	}
+	if (v116DummyPhys && NGreen::callback->mmioValid()) {
+		// PTE format (Gen8+): bits[47:12]=phys PFN, bit[3]=LLC-coherent, bit[0]=present
+		uint32_t pteLo = (uint32_t)(v116DummyPhys & 0xFFFFF000ULL) | 0x9;  // LLC | present
+		uint32_t pteHi = (uint32_t)(v116DummyPhys >> 32);
+		uint32_t oldLo = NGreen::callback->readReg32(GGTT_PTE_LO(0));
+		uint32_t oldHi = NGreen::callback->readReg32(GGTT_PTE_HI(0));
+		NGreen::callback->writeReg32(GGTT_PTE_LO(0), pteLo);
+		NGreen::callback->writeReg32(GGTT_PTE_HI(0), pteHi);
+		NGreen::callback->writeReg32(0x101008, 0x1);  // GGTT TLB flush
+		SYSLOG("ngreen", "V116: GGTT[0] 0x%08x:%08x -> 0x%08x:%08x (dummy phys=0x%llx)",
+			   oldHi, oldLo, pteHi, pteLo, (unsigned long long)v116DummyPhys);
 	}
 
 	auto ret= FunctionCast(start, callback->ostart)(that,param_1);
@@ -3676,7 +3474,7 @@ bool Gen11::start(void *that,void  *param_1)
 	// This is our earliest opportunity after ring activation.
 	if (!NGreen::callback->isRealTGL) {
 		uint32_t rcIntrPost = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
-		uint32_t wantBits = getV65Tier1WantBits(NGreen::callback->isRealTGL);
+		uint32_t wantBits = (1 << GEN11_RCS0) | (1 << GEN11_BCS);
 		uint32_t newEn = rcIntrPost | wantBits;
 		NGreen::callback->writeReg32(GEN11_RENDER_COPY_INTR_ENABLE, newEn);
 		// Re-unmask tier-2
@@ -3947,9 +3745,7 @@ bool Gen11::start(void *that,void  *param_1)
 		bool hasVARID = (accelSvc->getProperty("IOVARendererID") != nullptr);
 		SYSLOG("ngreen", "V45: properties present: MetalPlugin=%d GL=%d CFPlugIn=%d VARend=%d",
 			   hasMetal, hasGL, hasCFPI, hasVARID);
-			   
-		//v44ScheduleBundleLog(that, 500);
-
+		
 		// 5. If MetalPluginName is missing, set GPU properties directly on the service
 		//    (normally they come from the matched personality, but if IOKit didn't merge them...)
 		if (!hasMetal) {
@@ -4028,23 +3824,22 @@ bool Gen11::start(void *that,void  *param_1)
 		// -ngreenexp — without it, the display pipe is not terminated after opening.
 		if (!NGreen::callback->isRealTGL) {
 			// 8. V59: Schedule delayed child checks to rescue stuck IGAccelDevice children.
-		v45ScheduleDelayedCheck(that, 3000);
-		v45ScheduleDelayedCheck(that, 10000);
-		v45ScheduleDelayedCheck(that, 15000);
-		v45ScheduleDelayedCheck(that, 20000);
-		v45ScheduleDelayedCheck(that, 30000);
-		v45ScheduleDelayedCheck(that, 60000);
-		v45ScheduleDelayedCheck(that, 120000);
-		SYSLOG("ngreen", "V59: scheduled delayed child checks at T+3,10,15,20,30,60,120s");
+			v45ScheduleDelayedCheck(that, 3000);
+			v45ScheduleDelayedCheck(that, 10000);
+			v45ScheduleDelayedCheck(that, 15000);
+			v45ScheduleDelayedCheck(that, 20000);
+			v45ScheduleDelayedCheck(that, 30000);
+			v45ScheduleDelayedCheck(that, 60000);
+			v45ScheduleDelayedCheck(that, 120000);
+			SYSLOG("ngreen", "V59: scheduled delayed child checks at T+3,10,15,20,30,60,120s");
+
 			// V74: Start PERMANENT EMR enforcer — 50ms interval, runs forever.
-			// Required: keeps EMR masked so Apple can't re-enable error interrupts.
-			// Without this the display pipe fails to activate entirely (all-black screen).
+			// Retain the IOService so it stays alive while a timer is pending (UAF fix).
 			{
-				SYSLOG("ngreen", "V74: config maskWrites=1 v116Reenforce=1 maxIters=unlimited");
 				auto *emrSvc = static_cast<IOService *>(that);
 				emrSvc->retain();
 				auto emrTimer = thread_call_allocate(v71EmrEnforcer,
-								 static_cast<thread_call_param_t>(emrSvc));
+									 static_cast<thread_call_param_t>(emrSvc));
 				if (emrTimer) {
 					uint64_t deadline;
 					clock_interval_to_deadline(50, kMillisecondScale, &deadline);
@@ -4058,7 +3853,7 @@ bool Gen11::start(void *that,void  *param_1)
 			// V60: GPU health monitor (contains V77 DisplayPipe terminator) — opt-in only.
 			// Without this, IOAccelDisplayPipeUserClient2 is NOT killed after V59 opens it.
 			// Retain the IOService so it stays alive while a timer is pending (UAF fix).
-			if (isV60MonitorEnabled()) {
+			if (isExperimentalMonitorEnabled()) {
 				auto *monSvc = static_cast<IOService *>(that);
 				monSvc->retain();
 				auto monTimer = thread_call_allocate(v60GpuHealthMonitor,
@@ -4072,7 +3867,7 @@ bool Gen11::start(void *that,void  *param_1)
 					monSvc->release(); // alloc failed — drop our retain
 				}
 			} else {
-				SYSLOG("ngreen", "V110: V60 health monitor disabled (use -ngreenexp/-ngreenv60 to enable, -ngreenv60off to force disable)");
+				SYSLOG("ngreen", "V110: V60 health monitor disabled — DisplayPipe will not be terminated (use -ngreenexp to enable)");
 			}
 		}
 	}
@@ -5858,36 +5653,29 @@ void * Gen11::getBlit3DContext(void *that,bool param_1)
 	// set it for RPL hardware). All callers that dereference ctx+0xb8 are already guarded
 	// with !isRealTGL returns (initBlitUsage V121, markBlitUsage V122, beginCoalescedSegment
 	// V124, barrierSubmission V130). Accept any non-null ctx on RPL.
-	//
-	// V194: Always call Apple's original first. After gpuRestart the GPU is reset and all
-	// context objects are freed/reallocated. Apple's getBlit3DContext(task, true) checks
-	// task+0x298 and returns the current live context for that task. If it returns a
-	// DIFFERENT non-null ctx than our cache, it means restart happened — update the cache.
-	// Only fall back to the stale cache when Apple's original returns null (early init).
+	if (callback->v131CachedBlit3DCtx) {
+		void *b8 = getMember<void *>(callback->v131CachedBlit3DCtx, 0xb8);
+		if (b8 || !NGreen::callback->isRealTGL) {
+			if (isExperimentalMonitorEnabled())
+				SYSLOG("ngreen", "V148: getBlit3DContext using cached ctx=%p ctx+0xb8=%p",
+				       callback->v131CachedBlit3DCtx, b8);
+			return callback->v131CachedBlit3DCtx;
+		}
+	}
+
+	// Call Apple's original — it allocates, constructs, calls initWithOptions→initialize.
+	// Our initialize hook (V148) handles the RPL-safe init path.
+	// V165: On RPL accept ctx even when ctx+0xb8=NULL (base class doesn't set it on RPL).
 	if (callback->ogetBlit3DContext) {
 		void *ctx = FunctionCast(getBlit3DContext, callback->ogetBlit3DContext)(that, param_1);
 		void *b8 = ctx ? getMember<void *>(ctx, 0xb8) : nullptr;
 		if (ctx && (b8 || !NGreen::callback->isRealTGL)) {
-			if (ctx != callback->v131CachedBlit3DCtx) {
-				SYSLOG("ngreen", "V194: getBlit3DContext ctx changed %p -> %p (restart recovery), updating cache",
-				       callback->v131CachedBlit3DCtx, ctx);
-				callback->v131CachedBlit3DCtx = ctx;
-			} else if (isExperimentalMonitorEnabled()) {
-				SYSLOG("ngreen", "V148: getBlit3DContext using cached ctx=%p ctx+0xb8=%p",
-				       ctx, b8);
-			}
+			callback->v131CachedBlit3DCtx = ctx;
+			SYSLOG("ngreen", "V148: getBlit3DContext original succeeded ctx=%p ctx+0xb8=%p", ctx, b8);
 			return ctx;
 		}
 		SYSLOG("ngreen", "V148: getBlit3DContext original returned invalid ctx=%p ctx+0xb8=%p",
 		       ctx, b8);
-	}
-
-	// Apple's original returned null (early init) — fall back to previously cached ctx.
-	if (callback->v131CachedBlit3DCtx) {
-		if (isExperimentalMonitorEnabled())
-			SYSLOG("ngreen", "V148: getBlit3DContext using cached ctx=%p (original returned null)",
-			       callback->v131CachedBlit3DCtx);
-		return callback->v131CachedBlit3DCtx;
 	}
 
 	// Fallbacks: depth/color resolve contexts share the same +0xb8 layout.
@@ -5908,6 +5696,7 @@ void * Gen11::getBlit3DContext(void *that,bool param_1)
 	SYSLOG("ngreen", "V148: getBlit3DContext all paths exhausted");
 	return nullptr;
 }
+
 
 uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param_3, bool param_4) {
 	// V186: For spoofed non-TGL, if V142 is configured to bypass submitBlit,
@@ -6115,9 +5904,7 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 
 	return FunctionCast(submitBlit, callback->osubmitBlit)(that, param_1, param_2, param_3, param_4);
 }
-
-/* newer stub
-
+/*
 // submitBlit controls early screen bring-up and compositor blits.
 // On spoofed non-TGL we use the decompiled control split encoded in blit[0xA2] bits[4:3]:
 //   routeSel 0..2 -> 2D leg (unsafe on RPL due unchecked ctx+0xB8 deref in Apple's path), so bypass.
@@ -6379,15 +6166,41 @@ void * Gen11::getBlit2DContext(void *that,bool param_1)
 		}
 	}
 	
-	// V127: On non-real-TGL (RPL spoof), call the original getter and enforce only
-	// Blit2D-compatible fallbacks. submitBlit dereferences [ctx+0xb8] and then uses the
-	// resulting object as Blit2D FIFO/ring state, so returning depth/color/3D contexts here
-	// can corrupt renderer behavior (black output / wrong ring routing).
+	// V127: On non-real-TGL (RPL spoof), allow Blit2D context to initialize so that
+	// barrierSubmission (which dereferences ctx+0xb8 unconditionally) doesn't crash.
+	// We call the original and validate ctx+0xb8 before returning: if the context
+	// initialized correctly (field non-null), return it — barrierSubmission is safe.
+	// If ctx+0xb8 is null (init faulted or incomplete), prefer a validated resolve
+	// context fallback so barrierSubmission does not dereference a null task pointer.
+	// BCS submission guard remains upstream (submitBlit V120 + beginCoalescedSegment V124).
 	if (!NGreen::callback->isRealTGL) {
-		auto cachedValid2D = [&]() -> void * {
-			void *cached = callback->v131CachedBlit2DCtx;
-			if (cached && getMember<void *>(cached, 0xb8))
-				return cached;
+		auto fallbackResolveCtx = [&]() -> void * {
+			void *depth = getDepthResolveContext(that, param_1);
+			void *depthCtx = depth ? getMember<void *>(depth, 0xb8) : nullptr;
+			if (isExperimentalMonitorEnabled()) {
+				static int v137Blit2DFallbackCount = 0;
+				if (v137Blit2DFallbackCount < 40) {
+					v137Blit2DFallbackCount++;
+					SYSLOG("ngreen", "V137.getBlit2DContext[%d]: depth=%p depthCtx=%p", v137Blit2DFallbackCount, depth, depthCtx);
+				}
+			}
+			if (depth && getMember<void *>(depth, 0xb8)) {
+				DBGLOG("ngreen", "V129: getBlit2DContext using depth-resolve fallback");
+				return depth;
+			}
+			void *color = getColorResolveContext(that, param_1);
+			void *colorCtx = color ? getMember<void *>(color, 0xb8) : nullptr;
+			if (isExperimentalMonitorEnabled()) {
+				static int v137Blit2DFallbackColorCount = 0;
+				if (v137Blit2DFallbackColorCount < 40) {
+					v137Blit2DFallbackColorCount++;
+					SYSLOG("ngreen", "V137.getBlit2DContext.color[%d]: color=%p colorCtx=%p", v137Blit2DFallbackColorCount, color, colorCtx);
+				}
+			}
+			if (color && getMember<void *>(color, 0xb8)) {
+				DBGLOG("ngreen", "V129: getBlit2DContext using color-resolve fallback");
+				return color;
+			}
 			return nullptr;
 		};
 
@@ -6397,7 +6210,7 @@ void * Gen11::getBlit2DContext(void *that,bool param_1)
 				v136Logged = true;
 				SYSLOG("ngreen", "V136: ogetBlit2DContext is null");
 			}
-			void *fallback = cachedValid2D();
+			void *fallback = fallbackResolveCtx();
 			if (fallback)
 				return fallback;
 			return nullptr;
@@ -6413,19 +6226,26 @@ void * Gen11::getBlit2DContext(void *that,bool param_1)
 		}
 		if (!ctx) {
 			DBGLOG("ngreen", "V127: getBlit2DContext original returned null on RPL");
-			void *fallback = cachedValid2D();
+			void *fallback = fallbackResolveCtx();
 			if (fallback)
 				return fallback;
-			// No cross-context fallback allowed here (depth/color/3D are incompatible layouts).
+			// V131: When resolve fallback also fails, use cached 3D context as 2D fallback
+			if (callback->v131CachedBlit3DCtx) {
+				SYSLOG("ngreen", "V131: getBlit2DContext using cached 3D context as fallback");
+				return callback->v131CachedBlit3DCtx;
+			}
 			return nullptr;
 		}
 		void *ctxField = getMember<void *>(ctx, 0xb8);
 		if (!ctxField) {
-			DBGLOG("ngreen", "V127: getBlit2DContext ctx+0xb8 NULL on RPL, trying cached Blit2D fallback");
-			void *fallback = cachedValid2D();
+			DBGLOG("ngreen", "V127: getBlit2DContext ctx+0xb8 NULL on RPL, trying resolve fallback");
+			void *fallback = fallbackResolveCtx();
 			if (fallback)
 				return fallback;
-			return nullptr;
+			// V131: Cache this 2D context even with null field if no other option
+			callback->v131CachedBlit2DCtx = ctx;
+			SYSLOG("ngreen", "V131: getBlit2DContext caching partial context as fallback");
+			return ctx;
 		}
 		DBGLOG("ngreen", "V127: getBlit2DContext ctx=%p ctx+0xb8=%p OK on RPL", ctx, ctxField);
 		// V131: Cache valid context for future NULL fallback
@@ -6550,16 +6370,14 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 	const bool skipOriginal = checkKernelArgument("-ngreenV69SkipOriginal");
 	uint64_t gpuBufBase = mappedBufPtr ? getMember<uint64_t>(mappedBufPtr, 0x18) : 0;
 	uint64_t gpuBufSize = mappedBufPtr ? getMember<uint64_t>(mappedBufPtr, 0x20) : 0;
-	// Calling the original Blit3D initialize on spoofed RPL/ADL is still unsafe on Sonoma:
-	// crashes observed at initialize+0x4c with a write fault to the mapped scratch page.
-	// Keep original path blocked by default even when -ngreenV69AllowOriginal is set.
-	// Only allow with explicit unsafe override for debugging.
+	// V181: blit3d_initialize_scratch_space is now a no-op on !isRealTGL (the only step
+	// in initialize() that caused a write fault). With that intercepted, the original
+	// initialize() is safe to call — it will zero the header fields, skip the scratch write
+	// (our hook), and call blit3d_init_ctx, which is what enables getBlit2DContext.
 	// GPU VA is at mappedBuf[0x38], size at [0x20]. [0x18] is the task pointer, not GPU VA.
 	uint64_t gpuVA   = mappedBufPtr ? getMember<uint64_t>(mappedBufPtr, 0x38) : 0;
 	bool safeForOriginal = mappedBufPtr && gpuVA != 0 && gpuBufSize >= 0xD040;
-	const bool forceUnsafeOriginal = checkKernelArgument("-ngreenV69ForceOriginalUnsafe");
-	const bool shouldTryOriginal = allowOriginal && !skipOriginal && safeForOriginal &&
-		(NGreen::callback->isRealTGL || forceUnsafeOriginal);
+	const bool shouldTryOriginal = allowOriginal && !skipOriginal && safeForOriginal;
 	if (shouldTryOriginal) {
 		SYSLOG("ngreen", "V111B: calling original Blit3D init (opt-in, fullMTL=%d allow=%d skip=%d base=0x%llx size=0x%llx)",
 		       forceFullMTL, allowOriginal, skipOriginal,
@@ -6567,9 +6385,6 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 		FunctionCast(IGHardwareBlit3DContextinitialize, callback->oIGHardwareBlit3DContextinitialize)(that);
 		SYSLOG("ngreen", "V111B: original Blit3D init completed");
 		return;
-	}
-	if (!NGreen::callback->isRealTGL && allowOriginal && !forceUnsafeOriginal) {
-		SYSLOG("ngreen", "V111B: -ngreenV69AllowOriginal blocked on spoofed RPL/ADL (use -ngreenV69ForceOriginalUnsafe only for crash debugging)");
 	}
 	if (allowOriginal && !safeForOriginal) {
 		SYSLOG("ngreen", "V106: -ngreenV69AllowOriginal requested but rejected (base=0x%llx size=0x%llx)",
@@ -6659,26 +6474,25 @@ uint8_t Gen11::blit3d_init_ctx(void *that)
 
 void  Gen11::initBlitUsage(void *that)
 {
-	// V121: initBlitUsage reads [ctx+0xb8]+0x178 without null checks.
-	// Guard: skip if ctx+0xb8 is not yet populated (early init paths before
-	// blit3d_init_ctx has run). In the render phase ctx+0xb8 is always set.
+	// V121: On non-real-TGL, context+0xb8 may still be NULL on some init paths.
+	// The original initBlitUsage reads [ctx+0xb8]+0x178 without null checks → GPF.
+	// Called from IGAccelSegmentResourceList::prepare+0xf (Apple doesn't check return).
+	// On RPL spoof: just skip entirely; the blit usage counters at that+0x70/0x74
+	// remain zero, which is safe since no real blit 3D context is ever populated.
 	if (!NGreen::callback->isRealTGL) {
-		if (!getMember<void *>(that, 0xb8)) {
-			DBGLOG("ngreen", "V121: initBlitUsage deferred — ctx+0xb8 null");
-			return;
-		}
+		DBGLOG("ngreen", "V121: initBlitUsage suppressed on RPL (no blit3D ctx)");
+		return;
 	}
 	FunctionCast(initBlitUsage, callback->oinitBlitUsage)(that);
 }
 void  Gen11::markBlitUsage(void *that)
 {
-	// V122: markBlitUsage dereferences [ctx+0xb8] without null checks.
-	// Same guard as V121: skip only when ctx+0xb8 is not yet set.
+	// V122: markBlitUsage + 0x17 dereferences [ctx+0xb8] without null checks.
+	// Called from prepare+0x2a right after initBlitUsage. On RPL spoof, ctx+0xb8
+	// can still be null on partial init paths → same page fault as V121.
 	if (!NGreen::callback->isRealTGL) {
-		if (!getMember<void *>(that, 0xb8)) {
-			DBGLOG("ngreen", "V122: markBlitUsage deferred — ctx+0xb8 null");
-			return;
-		}
+		DBGLOG("ngreen", "V122: markBlitUsage suppressed on RPL (no blit3D ctx)");
+		return;
 	}
 	FunctionCast(markBlitUsage, callback->omarkBlitUsage)(that);
 }
@@ -6692,33 +6506,20 @@ uint32_t  Gen11::IGAccelSegmentResourceListprepare(void *that)
 }
 
 uint32_t Gen11::beginCoalescedSegment(void *that) {
-	// V124/IDA verified: beginCoalescedSegment is pure DTrace observability.
-	// Full disassembly:
-	//   [queue+0x830] = 0xFFFFFFFF           ← segment marker
-	//   task = *(*(queue+0x5C0)+0x150)
-	//   ctx  = getBlit3DContext(task, true)   ← may return null in early init
-	//   r15  = ctx+0xB8                       ← CRASH if ctx null or ctx+0xB8 null
-	//   r14  = r15+0x178                      ← usage counter
-	//   dtracePushUnique(queue+0x5C0+0xE08, queue+0x838)
-	//   dtHookSubmitQueueKMD(queue+0x838, 4, r14+1, r15+0x20, 0, 0)
-	// No GPU ring submission whatsoever.
-	//
-	// Always write queue+0x830 first (matches Apple's implementation).
-	reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(that) + 0x830)[0] = 0xFFFFFFFF;
-
+	// V124: beginCoalescedSegment+0x2f reads [member+0xb8] without null check.
+	// On RPL spoof the Blit3D context may be missing on partial init paths,
+	// so the field is NULL → page fault CR2=0xb8.
+	// processAndSubmitCoalescedSegments calls this even when prepare returns 0.
 	if (!NGreen::callback->isRealTGL) {
-		// Guard: ctx+0xB8 must be non-null before calling through (DTrace reads it).
-		// In early init getBlit3DContext returns null → skip DTrace, return 1.
-		// In render phase ctx+0xB8 is always populated → call through for correct tracing.
-		void *cached = callback->v131CachedBlit3DCtx;
-		if (!cached || !getMember<void *>(cached, 0xb8)) {
-			static int v124EarlyCount = 0;
-			if (v124EarlyCount < 8) {
-				v124EarlyCount++;
-				DBGLOG("ngreen", "V124[%d]: beginCoalescedSegment deferred — ctx+0xb8 null", v124EarlyCount);
-			}
-			return 1;
+		// Mirror the first write in Apple's implementation to keep queue state coherent
+		// for callers that poll this field during segment lifecycle.
+		static int v124CallCount = 0;
+		v124CallCount++;
+		reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(that) + 0x830)[0] = 0xFFFFFFFF;
+		if (v124CallCount <= 50 || v124CallCount % 100 == 0) {
+			SYSLOG("ngreen", "V124[%d]: beginCoalescedSegment bypassed on RPL (state primed) queue=%p", v124CallCount, that);
 		}
+		return 1;
 	}
 	return FunctionCast(beginCoalescedSegment, callback->obeginCoalescedSegment)(that);
 }
@@ -6805,6 +6606,19 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 	                                                                     count, list);
 }
 
+
+/*void Gen11::blit3d_initialize_scratch_space(void *that)
+{
+	// V181: On !isRealTGL the scratch buffer's CPU mapping (returned by getMemory()) is
+	// read-only — writing 0x44 bytes of TGL shader kernels to buf+0xD000 causes a write
+	// page fault (error code 0x2, CR2=buf+0xD000). Skip entirely on spoofed paths.
+	// The original initialize() is now safe to call because this is the only crashing step.
+	if (!NGreen::callback->isRealTGL) {
+		DBGLOG("ngreen", "V181: blit3d_initialize_scratch_space suppressed on RPL");
+		return;
+	}
+	FunctionCast(blit3d_initialize_scratch_space, callback->oblit3d_initialize_scratch_space)(that);
+}*/
 
 void Gen11::blit3d_initialize_scratch_space(void *that)
 {

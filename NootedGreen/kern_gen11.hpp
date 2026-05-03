@@ -1576,6 +1576,8 @@ private:
 	
 	static uint64_t raReadRegister64(void *that,unsigned long param_1);
 	mach_vm_address_t oraReadRegister64 {};
+
+
 	
 	static uint64_t raReadRegister64b(void *that,void *param_1,unsigned long param_2);
 	
@@ -1638,7 +1640,7 @@ private:
 	
 	static void blit3d_initialize_scratch_space(void *that);
 	mach_vm_address_t oblit3d_initialize_scratch_space {};
-
+	
 	// Extended GPU context init — sets up additional context state (PPGTT, aux tables)
 	static uint8_t	IGHardwareExtendedContextinitWithOptions
 			  (void *that,void *param_1,
