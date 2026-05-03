@@ -93,8 +93,16 @@ These properties are essential for correct platform identification and WEG coexi
 ## Boot args
 
 ```
--v keepsyms=1 debug=0x100 IGLogLevel=8 -NGreenDebug -liludbg liludump=200 ngreen-dmc=skip -allow3d -disablegfxfirmware -ngreenexp (as optional to try full MTL path : -ngreenfullmtl)
+-v keepsyms=1 debug=0x100 IGLogLevel=8 -NGreenDebug -liludbg liludump=100 ngreen-dmc=skip -allow3d -disablegfxfirmware -ngreenexp -ngreenfullmtlcore -ngreenfullmtldyld ngreenV142=3 -ngreenV142diag2d
 ```
+
+Current focused test for the accelerator-open path:
+
+```
+-v keepsyms=1 debug=0x100 IGLogLevel=8 -NGreenDebug -liludbg liludump=100 ngreen-dmc=skip -allow3d -disablegfxfirmware -ngreenexp -ngreenfullmtlcore -ngreenfullmtldyld ngreenV142=3 -ngreenV142diag2d -ngreenv60open
+```
+
+Do not add `-ngreenv60poll` for that test. That keeps the broad V45/V60 polling off and leaves only the narrow `V60O` `deviceStart` trace enabled.
 
 | Arg | Purpose |
 |---|---|
@@ -104,21 +112,27 @@ These properties are essential for correct platform identification and WEG coexi
 | `ngreen-dmc=skip` | Skip DMC firmware |
 | `-allow3d` | Force 3D acceleration |
 | `-nbdyldoff` | **Disable ALL DYLD patches** (CoreDisplay, OpenGL, Metal, SkyLight) — debug only |
-| `-ngreenexp` / `ngreenexp=1` | Enable experimental runtime monitor/timer paths (V60 monitor and extra diagnostics) |
+| `-ngreenexp` / `ngreenexp=1` | Enable experimental runtime diagnostics and monitor-owned debug paths. Some mutating experiments are now separately gated and no longer ride on `-ngreenexp` alone. |
 | `-ngreendp0` / `ngreendp0=1` | Force fallback mode: set `DisplayPipeSupported=0` in accelerator capabilities |
 | `-ngreendp1` / `ngreendp1=1` | Explicitly keep native `DisplayPipeSupported` path (default behavior) |
 | `ngreenV77DelayKill=N` | Delay V77 display-pipe client termination by `N` monitor iterations (`0..60`, default `60` = effectively disabled) |
 | `-ngreenv88` / `ngreenv88=1` | Enable V88 scanout fill + plane toggle diagnostics (draws test bars/colors; off by default) |
 | `-ngreenfullmtl` / `ngreenfullmtl=1` | Force full CoreDisplay Metal path on Ventura+/Sonoma by skipping Stage-3 NULL safety stubs (GetMTLTexture/GetMTLCommandQueue/RunFullDisplayPipe guard). This **does not** auto-enable Apple's original Blit3D initializer. |
+| `-ngreenfullmtlcore` | Force the CoreDisplay/CoreGraphics full-Metal path components currently under active RPL testing. Use with debug logging. |
+| `-ngreenfullmtldyld` | Force the DYLD-side full-Metal path components currently under active RPL testing. Use with debug logging. |
 | `ngreenV142=0|1|2|3` / `-ngreenV142hardunsupported` / `-ngreenV142ok` / `-ngreenV142pass` / `-ngreenV142orig` | Select spoof-path `submitBlit` behavior on non-real TGL. `0`=return unsupported, `1`=bypass return 0 (**default/recommended**), `2`=bypass return 1, `3`=call Apple original (high-risk diagnostic). V186 applies this mode early before task/context mutation to reduce `IGAccelTask::release` lifetime crashes. |
+| `-ngreenV142diag2d` / `ngreenV142diag2d=1` | Enable route selector / 2D-vs-3D submit diagnostics for `submitBlit` on spoofed paths. Useful when tracking routeSel transitions and V193 interaction. |
 | `-ngreenRefProbeF2` / `ngreenRefProbeF2=1` | Enable reference f2 osinfo patch probe on non-real TGL (diagnostic only) |
 | `-ngreenV69AllowOriginal` | Opt in to Apple's original Blit3D initialize on non-real TGL when safety preconditions are met. **High risk / diagnostic only**; can panic on unsupported setups. |
 | `-ngreenV69SkipOriginal` | Hard-disable Apple's original Blit3D initialize on non-real TGL, even if `-ngreenV69AllowOriginal` is present. |
+| `-ngreenv60open` / `ngreenv60open=1` | Narrow trace around `IGAccelDevice::deviceStart()` to capture the local gate before `IOServiceOpen`/accelerator-open success. Preferred next-step trace when `IntelAccelerator isOpen=0` forever. |
+| `-ngreenv60poll` / `ngreenv60poll=1` | Re-enable the broad V45 delayed child checks and V60 periodic health monitor polling. Leave this off when testing `-ngreenv60open` to keep logs focused. |
+| `-ngreenv79lin` / `ngreenv79lin=1` | Re-enable the old V79 plane linearization experiment. Diagnostic only. This can reinterpret the BIOS boot plane with the wrong layout and produce yellow/blue/green Apple flashes instead of the normal grey brief. |
 | `ngreenLanes=1|2|4` | Override lane count used by non-real TGL computeLaneCount bypass (default 2 lanes) |
 | `-ngreenforceprops` / `ngreenforceprops=1` | Enable legacy forced IGPU property injection (`AAPL,ig-platform-id`, `model`, `saved-config`, etc.). Disabled by default in compatibility-first mode. |
 | `IGLogLevel=8` | Maximum Intel GPU driver logging |
 | `-liludbg` | Enable Lilu debug logging |
-| `liludump=60` | Dump Lilu logs after 60 seconds |
+| `liludump=100` | Dump Lilu logs after 100 seconds |
 
 Recommended debug order for `ngreenV142` on spoofed RPL/ADL:
 

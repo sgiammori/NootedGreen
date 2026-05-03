@@ -81,6 +81,33 @@ static bool isExperimentalMonitorEnabled() {
 	return checkKernelArgument("-ngreenexp");
 }
 
+static bool isV60AcceleratorOpenTraceEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenv60open", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenv60open");
+}
+
+static bool isV60V45PollingEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenv60poll", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenv60poll");
+}
+
+static bool isV79PlaneLinearizationEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenv79lin", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenv79lin");
+}
+
 static bool isLegacyOwnershipModeEnabled() {
 	int enabled = 0;
 	if (PE_parse_boot_argn("ngreenlegacyown", &enabled, sizeof(enabled))) {
@@ -1501,8 +1528,30 @@ bool Gen11::deviceStart(void *that)
 	// start. On RPL hardware with TGL driver, BCS init fails (RPL uses different
 	// ring programming). We allow the original to run and then force success if it
 	// returned false, preventing CoreDisplay from seeing a null accelerator device.
+	if (isV60AcceleratorOpenTraceEnabled()) {
+		auto *svc = static_cast<IOService *>(that);
+		auto *provider = svc ? svc->getProvider() : nullptr;
+		SYSLOG("ngreen", "V60O: deviceStart enter dev=%p state=0x%llx open=%d provider=%s pstate=0x%llx popen=%d",
+		       that,
+		       svc ? (unsigned long long)svc->getState() : 0ULL,
+		       svc ? svc->isOpen() : 0,
+		       provider ? provider->getName() : "NULL",
+		       provider ? (unsigned long long)provider->getState() : 0ULL,
+		       provider ? provider->isOpen() : 0);
+	}
 	auto ret = FunctionCast(deviceStart, callback->odeviceStart)(that);
 	const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
+	if (isV60AcceleratorOpenTraceEnabled()) {
+		auto *svc = static_cast<IOService *>(that);
+		auto *provider = svc ? svc->getProvider() : nullptr;
+		SYSLOG("ngreen", "V60O: deviceStart exit dev=%p ret=%d state=0x%llx open=%d provider=%s pstate=0x%llx popen=%d",
+		       that, ret,
+		       svc ? (unsigned long long)svc->getState() : 0ULL,
+		       svc ? svc->isOpen() : 0,
+		       provider ? provider->getName() : "NULL",
+		       provider ? (unsigned long long)provider->getState() : 0ULL,
+		       provider ? provider->isOpen() : 0);
+	}
 	if (!isRealTGL && !ret) {
 		SYSLOG("ngreen", "V111: IGAccelDevice::deviceStart returned false on RPL — forcing true");
 		return true;
@@ -2151,6 +2200,9 @@ uint32_t Gen11::wrapProbeCDClockFrequency(void *that) {
 // V45: Delayed child check callback — runs on a kernel thread after a configurable delay.
 // Logs the IOService state and child count at the specified time after start().
 static void v45DelayedChildCheck(thread_call_param_t p0, thread_call_param_t p1) {
+	if (!isV60V45PollingEnabled())
+		return;
+
 	auto *svc = static_cast<IOService *>(p0);
 	unsigned delayMs = (unsigned)(uintptr_t)p1;
 	
@@ -2171,8 +2223,11 @@ static void v45DelayedChildCheck(thread_call_param_t p0, thread_call_param_t p1)
 				// V55: Enhanced IGAccelDevice diagnostics + force-start
 				if (delayMs >= 3000) {
 					const char *childName = child->getName();
-					if (childName && (strcmp(childName, "IGAccelDevice") == 0 ||
-									  strcmp(childName, "IGAccelSharedUserClient") == 0)) {
+					if (childName && (
+							strcmp(childName, "IGAccelDevice") == 0 ||
+							strcmp(childName, "IGAccelSharedUserClient") == 0 ||
+							strcmp(childName, "IOAccelDisplayPipeUserClient2") == 0 ||
+							strcmp(childName, "IGAccelCommandQueue") == 0)) {
 						// Dump child's provider and property state
 						auto *childProvider = child->getProvider();
 						SYSLOG("ngreen", "V55: %s state=0x%llx provider=%s isOpen=%d",
@@ -2231,6 +2286,9 @@ static void v45DelayedChildCheck(thread_call_param_t p0, thread_call_param_t p1)
 
 // V45: Helper to schedule a delayed child check
 static void v45ScheduleDelayedCheck(void *accelInstance, unsigned delayMs) {
+	if (!isV60V45PollingEnabled())
+		return;
+
 	thread_call_t tc = thread_call_allocate(v45DelayedChildCheck,
 											static_cast<thread_call_param_t>(accelInstance));
 	if (tc) {
@@ -2246,6 +2304,9 @@ static void v45ScheduleDelayedCheck(void *accelInstance, unsigned delayMs) {
 // V59 ReadRegister32 intercept caused regression (0 children). Back to timer-based.
 // Also applies EMR mask-all every cycle to prevent Apple from unmasking errors.
 void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t param1) {
+	if (!isV60V45PollingEnabled())
+		return;
+
 	static int v60Count = 0;
 	static uint32_t v60LastHead = 0xDEAD;
 	static uint32_t v60LastTail = 0xDEAD;
@@ -2620,11 +2681,12 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 	
-	// ── V79: Plane monitor / experimental linearization ──
-	// The old copy only reached brief first-light when the experimental path forced
-	// the scanout plane to linear and re-armed PLANE_SURF. Keep the default path
-	// read-only; restore the old behavior only with -ngreenexp.
-	if (isExperimentalMonitorEnabled()) {
+	// ── V79: Plane monitor / optional linearization ──
+	// Keep -ngreenexp diagnostic-only by default. The old linearization writes can
+	// produce false first-light by reinterpreting the BIOS boot plane with the wrong
+	// layout, which shows up as yellow/blue/green Apple flashes instead of the normal
+	// grey splash. Re-enable the mutating path only with explicit -ngreenv79lin.
+	if (isExperimentalMonitorEnabled() && isV79PlaneLinearizationEnabled()) {
 		if (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30) {
 			uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
 			uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
@@ -5482,6 +5544,7 @@ void Gen11::FastWriteRegister32(void *that,unsigned long param_1,uint32_t param_
 		param_2 &= ~(0x7u << 10); // clear tiling bits[12:10] → linear (V80 fix: was <<12)
 		DBGLOG("ngreen", "FastWrite PLANE_CTL fixup: forced linear tiling 0x%x", param_2);
 	}
+
 	return FunctionCast(FastWriteRegister32, callback->oFastWriteRegister32)(that,param_1,param_2 );
 }
 
@@ -6552,11 +6615,11 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 		//   ngreenV130=0 or -ngreenV130fail -> bypass and return 0 (default)
 		//   ngreenV130=1 or -ngreenV130pass -> bypass and return 1
 		//   ngreenV130=2 or -ngreenV130orig -> call original implementation
+		//   ngreenV130=3 or -ngreenV130hybrid -> bypass during init, original during render
 		// NOTE: on spoofed RPL this is unsafe unless explicitly forced because
 		// the original path submits Blit2D/Blit3D barriers through BCS.
 		// Use -ngreenV130forceorig only when intentionally validating that path.
 		static int v130Mode = -1;
-		static bool v130ModeInitialized = false;
 		if (v130Mode < 0) {
 			int parsed = 0;
 			const bool forceOrig = checkKernelArgument("-ngreenV130forceorig");
@@ -6564,6 +6627,8 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 				v130Mode = parsed;
 			} else if (checkKernelArgument("-ngreenV130orig")) {
 				v130Mode = 2;
+			} else if (checkKernelArgument("-ngreenV130hybrid")) {
+				v130Mode = 3;
 			} else if (checkKernelArgument("-ngreenV130pass")) {
 				v130Mode = 1;
 			} else if (checkKernelArgument("-ngreenV130fail")) {
@@ -6576,8 +6641,7 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 				SYSLOG("ngreen", "V150: ngreenV130orig requested on spoofed RPL; forcing mode=1 to avoid BCS barrier stall (use -ngreenV130forceorig to override)");
 				v130Mode = 1;
 			}
-			v130ModeInitialized = true;
-			SYSLOG("ngreen", "V130: INIT barrierSubmission spoof mode=%d (0=bypass-ret0, 1=bypass-ret1, 2=call-original) forceOrig=%d",
+			SYSLOG("ngreen", "V130: INIT barrierSubmission spoof mode=%d (0=bypass-ret0, 1=bypass-ret1, 2=call-original, 3=hybrid init-bypass/render-orig) forceOrig=%d",
 			       v130Mode, forceOrig ? 1 : 0);
 		}
 
@@ -6600,8 +6664,21 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 			       static_cast<unsigned>(count), v130Mode);
 		}
 
-		// Log the return path for first few calls to capture mode decision
 		uint8_t retVal = 0;
+		if (v130Mode == 3 && !isInitPhase) {
+			if (v130CallCount <= 24 || (v130CallCount > 100 && v130CallCount <= 124)) {
+				SYSLOG("ngreen", "V130[%d]: HYBRID render phase -> ORIGINAL path", v130CallCount);
+			}
+			retVal = FunctionCast(barrierSubmission, callback->obarrierSubmission)(queue, accelerator,
+			                                                                     cmdDesc, event,
+			                                                                     count, list);
+			if (v130CallCount <= 24 || (v130CallCount > 100 && v130CallCount <= 124)) {
+				SYSLOG("ngreen", "V130[%d]: HYBRID original returned %u", v130CallCount, static_cast<unsigned>(retVal));
+			}
+			return retVal;
+		}
+
+		// Log the return path for first few calls to capture mode decision
 		if (v130Mode == 2) {
 			if (v130CallCount <= 24) {
 				SYSLOG("ngreen", "V130[%d]: RETURNING ORIGINAL path (mode=2)", v130CallCount);
@@ -6615,7 +6692,7 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 			return retVal;
 		}
 
-		retVal = static_cast<uint8_t>(v130Mode == 1 ? 1 : 0);
+		retVal = static_cast<uint8_t>((v130Mode == 1 || v130Mode == 3) ? 1 : 0);
 		if (v130CallCount <= 24) {
 			SYSLOG("ngreen", "V130[%d]: RETURNING BYPASS path (mode=%d, ret=%u)", v130CallCount, v130Mode, static_cast<unsigned>(retVal));
 		}
