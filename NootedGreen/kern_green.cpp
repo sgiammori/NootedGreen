@@ -209,7 +209,7 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 
 		if (isLegacyIGPUPropSeedingEnabled()) {
 			seedIGPUPropertiesOnEntry(this->iGPU);
-		}	
+		}
 		
 		static uint8_t sconf[] = {};
 		
@@ -244,7 +244,7 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 		//NETLOG("gen11", "framebufferId: = %x", framebufferId);
 		//setRMMIOIfNecessary();
 
-		this->deviceId = WIOKit::readPCIConfigValue(this->iGPU, WIOKit::kIOPCIConfigDeviceID);
+        this->deviceId = WIOKit::readPCIConfigValue(this->iGPU, WIOKit::kIOPCIConfigDeviceID);
         this->pciRevision = WIOKit::readPCIConfigValue(NGreen::callback->iGPU, WIOKit::kIOPCIConfigRevisionID);
 
         // V52: Detect real TGL vs spoofed RPL/ADL by CPU model
@@ -392,7 +392,7 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				SYSLOG("ngreen", "V181: IOAF2 lock/unlock resolve failed");
 			}
 		}
-		
+
 	}  else if (kextIOGraphics.loadIndex == index) {
 		/*
 		KernelPatcher::RouteRequest requests[] = {

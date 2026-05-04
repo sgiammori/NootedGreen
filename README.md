@@ -24,9 +24,11 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 - **V88 scanout fill remains opt-in** (`-ngreenv88`). Default boots do not paint diagnostic bars over normal UI layout.
 - **GPU reset storm fully tamed (V157):** `resetGraphicsEngine` circuit-breaker (V153+V154) confirmed working — V153 fires from call #1 (coerces `ret=1025→0` when RCS ring head == tail), V154 opens at call #4 (skips original reset entirely after 3 consecutive quiescent coercions). Ring CTL is restored to `0x7001` (RING_ENABLE set) on every fake-success path via V155 saved-CTL restore.
 - **Execlist cleanup in progress (V158):** Root cause of remaining `userspace watchdog timeout` panics is identified — `EXEC=0x40018098` (execlist FIFO stalled, bit 30 set) and `CSB=0x1001` (15 unread context-status entries) persist post-fake-success, causing Apple's driver to keep scheduling resets. V158 addresses this by writing four null descriptors to `RING_ELSP` (cancelling pending EL0/EL1 contexts) and advancing the CSB read pointer to match the write pointer on every V153/V154 return-0 path.
+- **V80L root cause identified:** The `userspace watchdog timeout` KP (T+120s, 2 induced WS crashes) was traced to the V80L plane-linearization block inside `v71EmrEnforcer`. It was writing `PLANE_CTL` / `PLANE_STRIDE` / `PLANE_SURF` every 50ms while WindowServer was actively compositing those same registers — WS detected a render failure, crash-looped, and watchdogd fired. V80L is now limited to the first 3 enforcer ticks (≤150ms after `start()`), which preserves the visible brief display flash at early boot without fighting WS after it takes over the compositor. Use `-ngreenv80l` for continuous mode (testing only).
 
 ### Recent Progress
 
+- **V80L fix:** `userspace watchdog timeout` KP root cause confirmed and fixed. V80L (plane-linearization writes in `v71EmrEnforcer`) limited to first 3 ticks only. Brief display flash preserved; WS crash-loop eliminated. `-ngreenv80l` enables continuous mode for testing.
 - **V158:** Cancel pending execlist contexts + drain CSB after every fake-success `resetGraphicsEngine` return. Writes 4×0 to `RING_ELSP` (two null 64-bit context descriptors = cancel EL0 + EL1), then reads `RING_CONTEXT_STATUS_PTR` and writes back with read_ptr set to write_ptr. Logs `EXEC` value after the null writes to confirm whether execlist FIFO cleared. Applied on both V153 and V154 return-0 paths. Build confirmed clean. Boot test pending.
 - **V157:** Removed `rcsCtl == 0` guard from V153 quiescent check — hardware restores CTL to `0x7001` before V153 reads it, so the condition was always false. Only `rcsHead == rcsTail && err == 0` is needed. Boot log confirmed: V153 now fires from call #1.
 - **V156:** Fixed `RING_ENABLE` bit (ORed `| 1` at all CTL write sites). Dropped `bCtl == 0` from V154 check. Stabilized ring-enabled state across all fake-success paths.
@@ -67,7 +69,7 @@ Key registers (all offsets from `RENDER_RING_BASE = 0x2000`):
 
 ### Current Status
 
-System boots to login on RPL macOS 14.7.1 (`23H222`). The GPU reset storm is tamed: V153+V154 prevent the health monitor from burning the watchdog budget on redundant reset calls. CTL is stable at `0x7001`. Active investigation targets execlist/CSB cleanup (V158) to let Apple's driver recognize the engine as truly idle after each fake-success return. V88 visual fill is opt-in only (`-ngreenv88`) so default boots preserve normal Apple UI layout.
+System boots to login on RPL macOS 14.7.1 (`23H222`). The GPU reset storm is tamed: V153+V154 prevent the health monitor from burning the watchdog budget on redundant reset calls. CTL is stable at `0x7001`. The `userspace watchdog timeout` KP root cause has been identified and fixed: V80L plane-linearization writes in `v71EmrEnforcer` were fighting WindowServer over `PLANE_CTL`/`PLANE_STRIDE`/`PLANE_SURF` every 50ms — this has been corrected (first 3 ticks only). Active investigation continues on execlist/CSB cleanup (V158). V88 visual fill is opt-in only (`-ngreenv88`) so default boots preserve normal Apple UI layout.
 
 ## Requirements
 
@@ -93,46 +95,45 @@ These properties are essential for correct platform identification and WEG coexi
 ## Boot args
 
 ```
--v keepsyms=1 debug=0x100 IGLogLevel=8 -NGreenDebug -liludbg liludump=100 ngreen-dmc=skip -allow3d -disablegfxfirmware -ngreenexp -ngreenfullmtlcore -ngreenfullmtldyld ngreenV142=3 -ngreenV142diag2d
+-v keepsyms=1 debug=0x100 IGLogLevel=8 -NGreenDebug -liludbg liludump=200 ngreen-dmc=skip -allow3d -disablegfxfirmware -ngreenexp
 ```
-
-Current focused test for the accelerator-open path:
-
-```
--v keepsyms=1 debug=0x100 IGLogLevel=8 -NGreenDebug -liludbg liludump=100 ngreen-dmc=skip -allow3d -disablegfxfirmware -ngreenexp -ngreenfullmtlcore -ngreenfullmtldyld ngreenV142=3 -ngreenV142diag2d -ngreenv60open
-```
-
-Do not add `-ngreenv60poll` for that test. That keeps the broad V45/V60 polling off and leaves only the narrow `V60O` `deviceStart` trace enabled.
 
 | Arg | Purpose |
 |---|---|
 | `-NGreenDebug` | Enable NootedGreen debug logging |
 | `-disablegfxfirmware` | Disable GuC/HuC firmware loading — required on RPL/ADL because scheduler selection (`ngreenSched`) happens after the HW-branch `processKext`, so the driver attempts firmware init before NootedGreen can override the scheduler type. Not needed on real TGL (GuC loads natively). |
+| `-nbwegcoex` / `nbwegcoex=1` | Enable WEG coexistence mode. |
 | `ngreenSched=N` | Select GPU scheduler type: `3` = GuC firmware, `4` = IGScheduler4, `5` = host preemptive (default: `3` on real TGL, `5` on RPL/ADL) |
-| `ngreen-dmc=skip` | Skip DMC firmware |
+| `ngreen-dmc=skip|tgl|adlp` | DMC policy: skip CSR load, or force TGL/ADL-P DMC path for diagnostics. |
 | `-allow3d` | Force 3D acceleration |
 | `-nbdyldoff` | **Disable ALL DYLD patches** (CoreDisplay, OpenGL, Metal, SkyLight) — debug only |
-| `-ngreenexp` / `ngreenexp=1` | Enable experimental runtime diagnostics and monitor-owned debug paths. Some mutating experiments are now separately gated and no longer ride on `-ngreenexp` alone. |
+| `-ngreenexp` / `ngreenexp=1` | Enable experimental runtime monitor/timer paths (V60 monitor and extra diagnostics) |
+| `-ngreenv60` / `ngreenv60=1` | Force-enable V60 monitor. |
+| `-ngreenv60off` / `ngreenv60off=1` | Force-disable V60 monitor. |
+| `-ngreenv60rw` / `ngreenv60rw=1` | Enable aggressive V60 MMIO write path. |
 | `-ngreendp0` / `ngreendp0=1` | Force fallback mode: set `DisplayPipeSupported=0` in accelerator capabilities |
 | `-ngreendp1` / `ngreendp1=1` | Explicitly keep native `DisplayPipeSupported` path (default behavior) |
 | `ngreenV77DelayKill=N` | Delay V77 display-pipe client termination by `N` monitor iterations (`0..60`, default `60` = effectively disabled) |
 | `-ngreenv88` / `ngreenv88=1` | Enable V88 scanout fill + plane toggle diagnostics (draws test bars/colors; off by default) |
+| `-ngreenv93` / `ngreenv93=1` | Enable V93 plane guard diagnostics (disabled by default). |
 | `-ngreenfullmtl` / `ngreenfullmtl=1` | Force full CoreDisplay Metal path on Ventura+/Sonoma by skipping Stage-3 NULL safety stubs (GetMTLTexture/GetMTLCommandQueue/RunFullDisplayPipe guard). This **does not** auto-enable Apple's original Blit3D initializer. |
-| `-ngreenfullmtlcore` | Force the CoreDisplay/CoreGraphics full-Metal path components currently under active RPL testing. Use with debug logging. |
-| `-ngreenfullmtldyld` | Force the DYLD-side full-Metal path components currently under active RPL testing. Use with debug logging. |
+| `-ngreenfullmtldyld` / `ngreenfullmtldyld=1` | DYLD-side full-MTL override only. |
 | `ngreenV142=0|1|2|3` / `-ngreenV142hardunsupported` / `-ngreenV142ok` / `-ngreenV142pass` / `-ngreenV142orig` | Select spoof-path `submitBlit` behavior on non-real TGL. `0`=return unsupported, `1`=bypass return 0 (**default/recommended**), `2`=bypass return 1, `3`=call Apple original (high-risk diagnostic). V186 applies this mode early before task/context mutation to reduce `IGAccelTask::release` lifetime crashes. |
-| `-ngreenV142diag2d` / `ngreenV142diag2d=1` | Enable route selector / 2D-vs-3D submit diagnostics for `submitBlit` on spoofed paths. Useful when tracking routeSel transitions and V193 interaction. |
-| `-ngreenRefProbeF2` / `ngreenRefProbeF2=1` | Enable reference f2 osinfo patch probe on non-real TGL (diagnostic only) |
+| `-ngreenbcsirq` | Enable BCS bit in tier-1 interrupt want mask on spoof path (advanced diagnostic). |
+| `ngreenV120=0|1|2` / `-ngreenV120ok` / `-ngreenV120fail` / `-ngreenV120pass` | Fallback return mode used when submitBlit sees invalid/null task on spoof path. |
+| `ngreenV130=0|1|2|3` / `-ngreenV130fail` / `-ngreenV130pass` / `-ngreenV130orig` / `-ngreenV130hybrid` | `barrierSubmission` spoof policy on non-real TGL. |
+| `ngreenV130warmup=N` | Hybrid warmup window for `ngreenV130=3` (`0..200`, default 12 calls). |
+| `-ngreenV130forceorig` | Allow unsafe original barrier path when mode requests it. |
 | `-ngreenV69AllowOriginal` | Opt in to Apple's original Blit3D initialize on non-real TGL when safety preconditions are met. **High risk / diagnostic only**; can panic on unsupported setups. |
 | `-ngreenV69SkipOriginal` | Hard-disable Apple's original Blit3D initialize on non-real TGL, even if `-ngreenV69AllowOriginal` is present. |
-| `-ngreenv60open` / `ngreenv60open=1` | Narrow trace around `IGAccelDevice::deviceStart()` to capture the local gate before `IOServiceOpen`/accelerator-open success. Preferred next-step trace when `IntelAccelerator isOpen=0` forever. |
-| `-ngreenv60poll` / `ngreenv60poll=1` | Re-enable the broad V45 delayed child checks and V60 periodic health monitor polling. Leave this off when testing `-ngreenv60open` to keep logs focused. |
-| `-ngreenv79lin` / `ngreenv79lin=1` | Re-enable the old V79 plane linearization experiment. Diagnostic only. This can reinterpret the BIOS boot plane with the wrong layout and produce yellow/blue/green Apple flashes instead of the normal grey brief. |
-| `ngreenLanes=1|2|4` | Override lane count used by non-real TGL computeLaneCount bypass (default 2 lanes) |
+| `-ngreenV69ForceOriginalUnsafe` | Override safety rejection and force original Blit3D init on spoofed RPL/ADL (crash-debug only). |
+| `-ngreenv80l` / `ngreenv80l=1` | Run V80L plane-linearization writes continuously (every 50ms) instead of the default first-3-ticks-only behavior. **Testing only** — causes WS crash-loop + watchdog KP on normal boots. |
 | `-ngreenforceprops` / `ngreenforceprops=1` | Enable legacy forced IGPU property injection (`AAPL,ig-platform-id`, `model`, `saved-config`, etc.). Disabled by default in compatibility-first mode. |
+| `-ngreenV188htfind` | Enable narrow DYLD hash-find guard variant (V188) for AccessComplete crash diagnostics. |
+| `netdbg=<ip:port>` | Enable network debug logger destination for kernel-side NETDBG output. |
 | `IGLogLevel=8` | Maximum Intel GPU driver logging |
 | `-liludbg` | Enable Lilu debug logging |
-| `liludump=100` | Dump Lilu logs after 100 seconds |
+| `liludump=N` | Dump Lilu logs after `N` seconds (example: 125 or 200). |
 
 Recommended debug order for `ngreenV142` on spoofed RPL/ADL:
 
@@ -146,8 +147,7 @@ now applies a non-real-TGL-only DYLD guard (V188) that stubs the crashing
 `MTLRenderPipelineState` hash-table `find` specialization so CoreDisplay can take its
 fallback path. Real TGL behavior is unchanged.
 
-`-ngreenV187acstub` enables the older aggressive V187 debug path that short-circuits
-`DisplaySurface::AccessComplete()` entirely. Keep this disabled for normal testing.
+`-ngreenV188htfind` enables the optional narrow V188 hash-find debug path. Keep it off for normal testing.
 
 ## Hookcase
 
@@ -309,7 +309,7 @@ NootedGreen (Gen11/Gen12 — TGL driver spoofing):
 | Platform | Status | Est. | Notes |
 |----------|--------|------|-------|
 | **Tiger Lake** | ~90% | V52 | RPL-specific patches auto-skipped via CPUID. GuC, topology, ForceWake, BCS all use native Apple paths. Remaining risk: SKU bypass hook + DYLD patches still in the path. No real TGL hardware tested yet. |
-| **Raptor Lake-P** | ~65% | V158 | Primary dev platform (i7-13700H). System boots to login on macOS 14.7.1 (`23H222`). GPU reset storm tamed: V153/V154 circuit-breaker confirmed working (V153 fires call #1, V154 opens call #4), CTL stable at `0x7001`. Active fix: V158 clears execlist/CSB to stop Apple's driver seeing stale pending-context state post-fake-success. `userspace watchdog timeout` panic still under investigation. |
+| **Raptor Lake-P** | ~70% | V80L | Primary dev platform (i7-13700H). System boots to login on macOS 14.7.1 (`23H222`). GPU reset storm tamed: V153/V154 circuit-breaker confirmed working. `userspace watchdog timeout` KP root cause identified and fixed: V80L plane-linearization in `v71EmrEnforcer` was fighting WindowServer over plane registers every 50ms — now limited to first 3 ticks. Brief display flash at boot preserved. Active work: V158 execlist/CSB drain. |
 | **Alder Lake** | ~35% | — | Same Gen12 arch as RPL, should behave similarly. Untested. |
 | **Rocket Lake** | ~25% | — | Gen12 LP but different display engine. Untested. |
 | **Ice Lake** | ~50% | V52 | Dedicated ICL path exists (ICL FB + ICL HW kextInfos, ICL-specific object offsets in `getGPUInfoICL`, SKU gate×3, platform remap, PAVP hook, DYLD ICL Metal device-ID bypass). Topology hardcoded to ICL GT2 LP (1×8×8=64EU). IRQ init disabled (V37 boot hang). ICL path only activates when TGL kexts are absent. Untested on real ICL hardware. |

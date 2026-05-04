@@ -49,6 +49,24 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
     int pathlen = PATH_MAX;
     if (vn_getpath(vp, path, &pathlen) != 0) { return; }
 
+	// One-shot visibility logs for real bundle/image validation events.
+	// If these lines appear, the corresponding bundle image was actually seen by cs_validate_page.
+	static bool loggedTglMtl = false;
+	static bool loggedTglGl = false;
+	static bool loggedTglVa = false;
+	if (!loggedTglMtl && strstr(path, "AppleIntelTGLGraphicsMTLDriver.bundle")) {
+		loggedTglMtl = true;
+		SYSLOG("DYLD", "MTL_BUNDLE_SEEN: %s", path);
+	}
+	if (!loggedTglGl && strstr(path, "AppleIntelTGLGraphicsGLDriver.bundle")) {
+		loggedTglGl = true;
+		SYSLOG("DYLD", "GL_BUNDLE_SEEN: %s", path);
+	}
+	if (!loggedTglVa && strstr(path, "AppleIntelTGLGraphicsVADriver.bundle")) {
+		loggedTglVa = true;
+		SYSLOG("DYLD", "VA_BUNDLE_SEEN: %s", path);
+	}
+
     if (!UserPatcher::matchSharedCachePath(path)) {
         if (LIKELY(strncmp(path, kCoreLSKDMSEPath, arrsize(kCoreLSKDMSEPath))) ||
             LIKELY(strncmp(path, kCoreLSKDPath, arrsize(kCoreLSKDPath)))) {
@@ -236,16 +254,18 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	if (getKernelVersion() >= KernelVersion::Ventura) {
 		const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
 		const bool forceFullMTL = shouldForceFullMetalPath();
+		const bool applyCoreDisplaySafety = isRealTGL || forceFullMTL || !isRealTGL;
 		static bool loggedMetalMode = false;
 		if (!loggedMetalMode) {
 			const bool fullMTLActive = isRealTGL || forceFullMTL;
-			SYSLOG("DYLD", "FULL_MTL_ACTIVE=%d (isRealTGL=%d forceFullMTL=%d)", fullMTLActive, isRealTGL, forceFullMTL);
+			SYSLOG("DYLD", "FULL_MTL_ACTIVE=%d CORE_SAFETY_ACTIVE=%d (isRealTGL=%d forceFullMTL=%d)",
+			       fullMTLActive, applyCoreDisplaySafety, isRealTGL, forceFullMTL);
 			loggedMetalMode = true;
 		}
 
-		// All CoreDisplay patches are gated on forceFullMTL or isRealTGL.
-		// Without -ngreenfullmtldyld (or -ngreenfullmtl), Stage 1 is zero-DYLD for CoreDisplay.
-		if (isRealTGL || forceFullMTL) {
+		// Keep these safety guards enabled on spoofed hardware even without full-MTL args,
+		// otherwise WindowServer/cursor init can regress before fallback stubs engage.
+		if (applyCoreDisplaySafety) {
 			const DYLDPatch assertionPatch[] = {
 				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
 			};
