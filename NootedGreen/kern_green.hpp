@@ -72,12 +72,7 @@ class NGreen {
 	UInt32 stolen_size;
 	uint32_t framebufferId {0};
 	
-    private:
-	
-	// Returns true when MMIO mapping is live and safe to access.
-	bool mmioValid() const { return rmmio != nullptr && rmmioPtr != nullptr; }
-
-	// reg = byte offset (i915 convention). rmmioPtr is uint32_t* so divide by 4.
+	// Public MMIO register access (used by display link training, display merge, etc.)
 	UInt32 readReg32(unsigned long reg) {
 		if (!rmmio || !rmmioPtr) return 0;
 		if (reg + sizeof(uint32_t) <= this->rmmio->getLength()) {
@@ -173,15 +168,18 @@ class NGreen {
 		}
 	}
 	
-	uint32_t intel_de_rmw(uint32_t reg, uint32_t clear, uint32_t set)
-	{
+	uint32_t intel_de_rmw(uint32_t reg, uint32_t clear, uint32_t set) {
 		uint32_t old, val;
-
 		old = readReg32(reg);
 		val = (old & ~clear) | set;
 		writeReg32(reg, val);
 		return old;
 	}
+
+    private:
+	
+	// Returns true when MMIO mapping is live and safe to access.
+	bool mmioValid() const { return rmmio != nullptr && rmmioPtr != nullptr; }
 	
 	void whitelist_reg_ext(uint32_t reg, uint32_t flags)
 	{
