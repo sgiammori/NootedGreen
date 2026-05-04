@@ -108,6 +108,15 @@ static bool isV79PlaneLinearizationEnabled() {
 	return checkKernelArgument("-ngreenv79lin");
 }
 
+static bool isV79PlanePulseEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenv79pulse", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenv79pulse");
+}
+
 static bool isLegacyOwnershipModeEnabled() {
 	int enabled = 0;
 	if (PE_parse_boot_argn("ngreenlegacyown", &enabled, sizeof(enabled))) {
@@ -188,32 +197,6 @@ static bool shouldForceFullMetalPath() {
 		return enabled != 0;
 	}
 	return checkKernelArgument("-ngreenfullmtl");
-}
-
-static int getV142SubmitBlitMode() {
-	int parsed = 0;
-	if (PE_parse_boot_argn("ngreenV142", &parsed, sizeof(parsed))) {
-		return parsed;
-	}
-
-	if (checkKernelArgument("-ngreenV142orig"))
-		return 3;
-	if (checkKernelArgument("-ngreenV142pass"))
-		return 2;
-	if (checkKernelArgument("-ngreenV142ok"))
-		return 1;
-	if (checkKernelArgument("-ngreenV142hardunsupported"))
-		return 0;
-	if (checkKernelArgument("-ngreenV142unsupported"))
-		return 1;
-
-	// V170: RPL (and any non-TGL spoof) cannot execute the TGL-format 3D blit commands that
-	// the original IGAccelBlit::submitBlit generates — the RCS EU stalls indefinitely
-	// (INSTDONE=0xfffffffe, bit-0 stuck) causing an infinite hangcheck→reset→retry loop
-	// that kills WindowServer within 120 s. Default to mode 1 (return 0 = success, no-op)
-	// so the compositor initialises without hanging. Real TGL hardware still uses mode 3.
-	// Override with -ngreenV142orig or ngreenV142=3 to restore original blit submission.
-	return 1;
 }
 
 static bool isV88ScanoutFillEnabled() {
@@ -2681,33 +2664,62 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 	
-	// ── V79: Plane monitor / optional linearization ──
-	// Keep -ngreenexp diagnostic-only by default. The old linearization writes can
-	// produce false first-light by reinterpreting the BIOS boot plane with the wrong
-	// layout, which shows up as yellow/blue/green Apple flashes instead of the normal
-	// grey splash. Re-enable the mutating path only with explicit -ngreenv79lin.
+	// ── V79: Non-destructive plane watchdog ──
+	// Snapshot the BIOS plane state on the first tick when it is enabled, then
+	// restore it verbatim if the driver subsequently disables it (PLANE_CTL bit31=0).
+	// The tiling mode and stride are NEVER changed — the underlying buffer data is
+	// still tiled and reinterpreting it as linear produces the corrupted
+	// "vertical-bars / tiled logo" artifact seen in the photo.
 	if (isExperimentalMonitorEnabled() && isV79PlaneLinearizationEnabled()) {
-		if (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30) {
-			uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
-			uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
-			uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
-			if (tiling != 0) {
-				uint32_t newCtl = planCtl & ~(0x7u << 10); // clear tiling -> linear
-				uint32_t newStrd = planStrd;
-				if (tiling == 1) {
-					newStrd = planStrd * 8;
-				} else if (tiling == 4) {
-					newStrd = planStrd * 16;
-				}
-				NGreen::callback->writeReg32(0x70180, newCtl);
-				NGreen::callback->writeReg32(0x70188, newStrd);
-				uint32_t planSurf = NGreen::callback->readReg32(0x7019C);
-				NGreen::callback->writeReg32(0x7019C, planSurf);
-				SYSLOG("ngreen", "V79[%d]: tiling %d->linear CTL 0x%x->0x%x STRIDE 0x%x->0x%x SURF=0x%x",
-					   v60Count, tiling, planCtl, newCtl, planStrd, newStrd, planSurf);
-			} else {
-				SYSLOG("ngreen", "V79[%d]: already linear CTL=0x%x STRIDE=0x%x", v60Count, planCtl, planStrd);
+		static uint32_t v79SavedCtl  = 0;
+		static uint32_t v79SavedStrd = 0;
+		static uint32_t v79SavedSurf = 0;
+		static bool     v79Snapshotted = false;
+		static bool     v79EnablePulseUsed = false;
+
+		uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
+		uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
+		uint32_t planSurf = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
+		bool     enabled  = !!(planCtl & (1u << 31));
+		uint32_t tiling   = (planCtl >> 10) & 0x7;
+		bool     hasLivePlane = (planStrd != 0) && (planSurf != 0);
+
+		if (!v79Snapshotted && enabled) {
+			// First valid tick — capture original BIOS plane state.
+			// Re-arm SURF to ensure scanout stays active (this is what kept the
+			// Apple logo visible). Tiling bits are NOT touched.
+			v79SavedCtl  = planCtl;
+			v79SavedStrd = planStrd;
+			v79SavedSurf = planSurf;
+			v79Snapshotted = true;
+			NGreen::callback->writeReg32(0x7019C, planSurf); // re-arm SURF to keep scanout live
+			SYSLOG("ngreen", "V79[%d]: snapshot+rearm CTL=0x%x STRIDE=0x%x SURF=0x%x tiling=%d",
+				   v60Count, planCtl, planStrd, planSurf, tiling);
+		} else if (!enabled && hasLivePlane && !v79EnablePulseUsed && v60Count <= 12 && isV79PlanePulseEnabled()) {
+			// Conservative lost-logo recovery: do a single early enable pulse using
+			// live registers only. Do not rewrite stride/tiling semantics.
+			uint32_t pulseCtl = planCtl | (1u << 31);
+			NGreen::callback->writeReg32(0x70180, pulseCtl);
+			NGreen::callback->writeReg32(0x7019C, planSurf);
+			v79EnablePulseUsed = true;
+			if (!v79Snapshotted) {
+				v79SavedCtl = pulseCtl;
+				v79SavedStrd = planStrd;
+				v79SavedSurf = planSurf;
+				v79Snapshotted = true;
 			}
+			SYSLOG("ngreen", "V79[%d]: one-shot pulse CTL=0x%x STRIDE=0x%x SURF=0x%x tiling=%d",
+				   v60Count, pulseCtl, planStrd, planSurf, tiling);
+		} else if (!enabled && hasLivePlane && !v79EnablePulseUsed && v60Count <= 12) {
+			SYSLOG("ngreen", "V79[%d]: pulse disabled (use -ngreenv79pulse) CTL=0x%x STRIDE=0x%x SURF=0x%x tiling=%d",
+				   v60Count, planCtl, planStrd, planSurf, tiling);
+		} else if (!enabled && v79EnablePulseUsed && (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30)) {
+			SYSLOG("ngreen", "V79[%d]: disabled after one-shot pulse CTL=0x%x STRIDE=0x%x SURF=0x%x",
+				   v60Count, planCtl, planStrd, planSurf);
+		} else if (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30) {
+			SYSLOG("ngreen", "V79[%d]: plane OK enabled=%d snap=%d CTL=0x%x STRIDE=0x%x SURF=0x%x tiling=%d",
+				   v60Count, enabled ? 1 : 0, v79Snapshotted ? 1 : 0,
+				   planCtl, planStrd, planSurf, tiling);
 		}
 	} else {
 		uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
@@ -5769,7 +5781,7 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 	if (!NGreen::callback->isRealTGL) {
 		static int v186Mode = -1;
 		if (v186Mode < 0) {
-			v186Mode = getV142SubmitBlitMode();
+			v186Mode = 3; // default: no spoof, run original (safe)
 			SYSLOG("ngreen", "V186: early submitBlit spoof mode=%d (0=unsupported,1=ret0,2=ret1,3=orig)", v186Mode);
 		}
 
@@ -5932,7 +5944,7 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 		// spoofed RPL boots when we need to prove the hang is inside submitBlit itself.
 		static int v142Mode = -1;
 		if (v142Mode < 0) {
-			v142Mode = getV142SubmitBlitMode();
+			v142Mode = 3; // default: no spoof, run original (safe)
 			SYSLOG("ngreen", "V142: submitBlit spoof mode=%d (0=hard-unsupported,1=ret0,2=ret1,3=orig)", v142Mode);
 		}
 
@@ -6634,7 +6646,9 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 			} else if (checkKernelArgument("-ngreenV130fail")) {
 				v130Mode = 0;
 			} else {
-				v130Mode = 0;
+				// Default: bypass+ret1 so GPU scheduler treats barrier as succeeded.
+				// ret0 causes a spin/wait loop in the scheduler → hard freeze.
+				v130Mode = 1;
 			}
 
 			if (v130Mode == 2 && !forceOrig) {
@@ -6648,11 +6662,23 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 		static int v130CallCount = 0;
 		static int v130CallInitPhase = 0;
 		static int v130CallRenderPhase = 0;
+		static int v130HybridWarmup = -1;
+		if (v130HybridWarmup < 0) {
+			int parsedWarmup = 12;
+			if (PE_parse_boot_argn("ngreenV130warmup", &parsedWarmup, sizeof(parsedWarmup))) {
+				if (parsedWarmup < 0) parsedWarmup = 0;
+				if (parsedWarmup > 200) parsedWarmup = 200;
+			}
+			v130HybridWarmup = parsedWarmup;
+			if (v130Mode == 3) {
+				SYSLOG("ngreen", "V130: hybrid warmup=%d calls (override with ngreenV130warmup=<0..200>)", v130HybridWarmup);
+			}
+		}
 		
 		v130CallCount++;
 		// V151 DIAGNOSTIC: Enhanced logging to trace call patterns through init vs render phases
-		// First ~100 calls are typically device init; thousands indicate rendering phase
-		bool isInitPhase = v130CallCount < 100;
+		// For hybrid mode, keep bypass window short to avoid WindowServer init starvation.
+		bool isInitPhase = v130CallCount <= v130HybridWarmup;
 		if (isInitPhase) v130CallInitPhase++;
 		else v130CallRenderPhase++;
 		
