@@ -327,10 +327,22 @@ bool Genx::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 						
 						// Replace `shll` with `nop`s
 						// The number of nops is determined by the actual instruction length
+						// Bounds check: x86 instructions are at most 15 bytes
+						if (shllSize > 15) {
+							SYSLOG("ngreen", "FBMemMgr_Init: shllSize %u exceeds max instruction size, aborting patch", shllSize);
+							MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+							return false;
+						}
 						lilu_os_memcpy(reinterpret_cast<void*>(shllAddr), nops, shllSize);
 						
 						// Replace `andl` with `movl`
 						// The patch contents and size are determined by the destination register of `andl`
+						// Bounds check: patchSize must be within expected movl encoding range (5–7 bytes)
+						if (patchSize > 7) {
+							SYSLOG("ngreen", "FBMemMgr_Init: patchSize %u exceeds expected patch size, aborting patch", patchSize);
+							MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+							return false;
+						}
 						lilu_os_memcpy(reinterpret_cast<void*>(andlAddr), patchStart, patchSize);
 						
 						// Finished applying the binary patch
