@@ -327,9 +327,9 @@ bool Genx::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 						
 						// Replace `shll` with `nop`s
 						// The number of nops is determined by the actual instruction length
-						// Bounds check: x86 instructions are at most 15 bytes
-						if (shllSize > 15) {
-							SYSLOG("ngreen", "FBMemMgr_Init: shllSize %u exceeds max instruction size, aborting patch", shllSize);
+						// Bounds check: validate shllSize fits within NOP buffer
+						if (shllSize > sizeof(nops)) {
+							SYSLOG("ngreen", "FBMemMgr_Init: shllSize %u exceeds NOP buffer size %zu, aborting patch", shllSize, sizeof(nops));
 							MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
 							return false;
 						}
@@ -337,9 +337,9 @@ bool Genx::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 						
 						// Replace `andl` with `movl`
 						// The patch contents and size are determined by the destination register of `andl`
-						// Bounds check: patchSize must be within expected movl encoding range (5–7 bytes)
-						if (patchSize > 7) {
-							SYSLOG("ngreen", "FBMemMgr_Init: patchSize %u exceeds expected patch size, aborting patch", patchSize);
+						// Bounds check: validate patchSize fits within movl buffer
+						if (patchSize > sizeof(movl)) {
+							SYSLOG("ngreen", "FBMemMgr_Init: patchSize %u exceeds movl buffer size %zu, aborting patch", patchSize, sizeof(movl));
 							MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
 							return false;
 						}
