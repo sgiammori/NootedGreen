@@ -10,6 +10,7 @@
 #include "kern_patcherplus.hpp"
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_devinfo.hpp>
+#include <IOKit/IODeviceTreeSupport.h>
 
 
 static const char *pathIOAcceleratorFamily2= "/System/Library/Extensions/IOAcceleratorFamily2.kext/Contents/MacOS/IOAcceleratorFamily2";
@@ -343,6 +344,26 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
             this->isRealTGL = (model == 0x8C || model == 0x8D);
             SYSLOG("ngreen", "V52: CPU family=0x%x model=0x%x stepping=%u isRealTGL=%d",
                    family, model, stepping, this->isRealTGL);
+        }
+
+        // AppleGVA's AVDGetGPUAccelerators switches on the DT root's hwgva-id (the key its "board-id" read becomes under the DYLD
+        // patch). For iMacPro1,1, the value DYLDPatches publishes early, it keeps an AMD accelerator or none, so the Intel VA plug-in
+        // is never created and every hardware decode ends in "Error loading GPU renderer". Any board outside its three iMac Pro /
+        // Mac Pro cases takes the Intel path: on Raptor Lake-HX the root's own board-id (the SMBIOS one) is published instead.
+        // AppleGVA's and AppleVPA's per-board plist entries follow the same key.
+        if (isRaptorLakeHX()) {
+            auto *root = IORegistryEntry::fromPath("/", gIODTPlane);
+            if (root != nullptr) {
+                auto *boardId = OSDynamicCast(OSData, root->getProperty("board-id"));
+                if (boardId != nullptr) {
+                    root->setProperty("hwgva-id", boardId);
+                    SYSLOG("ngreen", "hwgva-id set to the board-id %.*s: AppleGVA's board switch takes the Intel path",
+                           static_cast<int>(boardId->getLength()), static_cast<const char *>(boardId->getBytesNoCopy()));
+                } else {
+                    SYSLOG("ngreen", "hwgva-id left as iMacPro1,1: no board-id on the DT root");
+                }
+                OSSafeReleaseNULL(root);
+            }
         }
 		
 		auto gms = WIOKit::readPCIConfigValue(devInfo->videoBuiltin, WIOKit::kIOPCIConfigGraphicsControl, 0, 16) >> 8;
