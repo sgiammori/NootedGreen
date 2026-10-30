@@ -1661,30 +1661,115 @@ static void intel_dsc_pps_write(uint32_t reg, uint32_t pps_val, int vdsc_per_pip
 		NGreen::callback->writeReg32(reg + static_cast<uint32_t>(i) * kVdscDsc1Offset, pps_val);
 }
 
-static void intel_dsc_pps_configure(const uint32_t *dw, int vdsc_per_pipe) {
-	// Apple hands RC rows of zero for some modes; they are then left to the hardware (i915 always computes and writes its own).
-	bool rcZero = true;
-	for (uint32_t i = kVdscPpsRegs; i < kVdscRegs; i++) rcZero = rcZero && dw[i] == 0u;
-	for (uint32_t i = 0; i < kVdscRegs; i++) {
-		if (i >= kVdscPpsRegs && rcZero) continue;
-		intel_dsc_pps_write(kVdscReg[i], dw[i], vdsc_per_pipe);
+// From drm, display/drm_dsc_helper.c: drm_dsc_pps_payload_pack packs drm_dsc_config's rc_buf_thresh into PPS 44-57 and its
+// rc_range_params into PPS 58-87; drm_dsc_pps_payload_unpack_rc reads those two fields back. Apple's setupDSCEngineParams computes the
+// RC parameters only into the 128 PPS bytes configurePPSSDP sends (controller+0xfdd) and hands RC rows of zero in its CRTC parameters.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/display/drm_dsc_helper.c#L236-L254
+// https://github.com/torvalds/linux/blob/65ba8f3/include/drm/display/drm_dsc.h#L14-L41
+// https://github.com/torvalds/linux/blob/65ba8f3/include/drm/display/drm_dsc.h#L50-L66
+#define DSC_NUM_BUF_RANGES			15
+#define DSC_RANGE_BPG_OFFSET_MASK		0x3f
+#define DSC_PPS_RC_RANGE_MINQP_SHIFT		11
+#define DSC_PPS_RC_RANGE_MAXQP_SHIFT		6
+static constexpr size_t kVdscControllerPps = 0xfdd;
+
+struct drm_dsc_rc_range_parameters {
+	uint8_t range_min_qp;
+	uint8_t range_max_qp;
+	uint8_t range_bpg_offset;
+};
+
+/* drm_dsc_config's RC fields */
+struct drm_dsc_config {
+	uint16_t rc_buf_thresh[DSC_NUM_BUF_RANGES - 1];
+	struct drm_dsc_rc_range_parameters rc_range_params[DSC_NUM_BUF_RANGES];
+};
+
+static void drm_dsc_pps_payload_unpack_rc(struct drm_dsc_config *dsc_cfg, const uint8_t *pps_payload)
+{
+	int i;
+
+	/* PPS 44 - 57 */
+	for (i = 0; i < DSC_NUM_BUF_RANGES - 1; i++)
+		dsc_cfg->rc_buf_thresh[i] = pps_payload[44 + i];
+
+	/* PPS 58 - 87 */
+	/*
+	 * For DSC sink programming the RC Range parameter fields
+	 * are as follows: Min_qp[15:11], max_qp[10:6], offset[5:0]
+	 */
+	for (i = 0; i < DSC_NUM_BUF_RANGES; i++) {
+		const uint16_t rc_range_parameters = static_cast<uint16_t>(pps_payload[58 + 2 * i] << 8 | pps_payload[59 + 2 * i]);
+
+		dsc_cfg->rc_range_params[i].range_min_qp = rc_range_parameters >> DSC_PPS_RC_RANGE_MINQP_SHIFT;
+		dsc_cfg->rc_range_params[i].range_max_qp = (rc_range_parameters >> DSC_PPS_RC_RANGE_MAXQP_SHIFT) & 0x1f;
+		dsc_cfg->rc_range_params[i].range_bpg_offset = rc_range_parameters & DSC_RANGE_BPG_OFFSET_MASK;
 	}
 }
 
-static void intel_dsc_enable(const uint32_t *dw) {
+// From i915, intel_vdsc.c intel_dsc_pps_configure: the RC_BUF_THRESH and RC_RANGE_PARAMETERS words from drm_dsc_config.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_vdsc.c#L631-L691
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_vdsc_regs.h#L287-L289
+#define BITS_PER_BYTE		8
+#define RC_BPG_OFFSET_SHIFT	10
+#define RC_MAX_QP_SHIFT		5
+#define RC_MIN_QP_SHIFT		0
+
+static void intel_dsc_rc_dwords(const struct drm_dsc_config *vdsc_cfg, uint32_t rc_buf_thresh_dword[4], uint32_t rc_range_params_dword[8])
+{
+	int i;
+
+	/* Populate the RC_BUF_THRESH registers */
+	memset(rc_buf_thresh_dword, 0, 4 * sizeof(uint32_t));
+	for (i = 0; i < DSC_NUM_BUF_RANGES - 1; i++)
+		rc_buf_thresh_dword[i / 4] |=
+			(uint32_t)(vdsc_cfg->rc_buf_thresh[i] <<
+				   BITS_PER_BYTE * (i % 4));
+
+	/* Populate the RC_RANGE_PARAMETERS registers */
+	memset(rc_range_params_dword, 0, 8 * sizeof(uint32_t));
+	for (i = 0; i < DSC_NUM_BUF_RANGES; i++)
+		rc_range_params_dword[i / 2] |=
+			(uint32_t)(((vdsc_cfg->rc_range_params[i].range_bpg_offset <<
+				     RC_BPG_OFFSET_SHIFT) |
+				    (vdsc_cfg->rc_range_params[i].range_max_qp <<
+				     RC_MAX_QP_SHIFT) |
+				    (vdsc_cfg->rc_range_params[i].range_min_qp <<
+				     RC_MIN_QP_SHIFT)) << 16 * (i % 2));
+}
+
+static const char *intel_dsc_pps_configure(const uint32_t *dw, int vdsc_per_pipe, const void *controller) {
+	// Apple hands RC rows of zero for some modes. On 8086:A788 they are then computed from Apple's PPS bytes as above (the 240 Hz mode);
+	// elsewhere they are left to the hardware (i915 always computes and writes its own).
+	uint32_t rc[kVdscRegs - kVdscPpsRegs];
+	bool rcZero = true;
+	for (uint32_t i = kVdscPpsRegs; i < kVdscRegs; i++) rcZero = rcZero && dw[i] == 0u;
+	const bool rcFromPps = rcZero && controller != nullptr && IS_RAPTOR_LAKE_HX();
+	if (rcFromPps) {
+		struct drm_dsc_config vdsc_cfg;
+		drm_dsc_pps_payload_unpack_rc(&vdsc_cfg, static_cast<const uint8_t *>(controller) + kVdscControllerPps);
+		intel_dsc_rc_dwords(&vdsc_cfg, rc, rc + 4);
+	}
+	for (uint32_t i = 0; i < kVdscRegs; i++) {
+		if (i >= kVdscPpsRegs && rcZero && !rcFromPps) continue;
+		intel_dsc_pps_write(kVdscReg[i], i >= kVdscPpsRegs && rcFromPps ? rc[i - kVdscPpsRegs] : dw[i], vdsc_per_pipe);
+	}
+	return rcFromPps ? "computed from the PPS" : rcZero ? "left to the hardware" : "written";
+}
+
+static void intel_dsc_enable(const uint32_t *dw, const void *controller) {
 	auto *cb = NGreen::callback;
 	const int vdsc_instances_per_pipe = intel_dsc_get_vdsc_per_pipe(dw[25]);
-	intel_dsc_pps_configure(dw, vdsc_instances_per_pipe);
+	const char *rc = intel_dsc_pps_configure(dw, vdsc_instances_per_pipe, controller);
 	cb->writeReg32(ICL_PIPE_DSS_CTL1(PIPE_A), dw[24]);
 	cb->writeReg32(ICL_PIPE_DSS_CTL2(PIPE_A), dw[25]);
 	static volatile uint32_t rows = 0;
 	if (__sync_add_and_fetch(&rows, 1u) <= 2u)
 		SYSLOG("ngreen", "VDSC pipe A enabled as intel_dsc_enable: %d engine(s), PPS0 0x%x, RC rows %s, DSS_CTL1 0x%x DSS_CTL2 0x%x",
-		       vdsc_instances_per_pipe, dw[0], dw[kVdscPpsRegs] == 0u && dw[kVdscPpsRegs + 1] == 0u ? "left to the hardware" : "written",
-		       cb->readReg32(ICL_PIPE_DSS_CTL1(PIPE_A)), cb->readReg32(ICL_PIPE_DSS_CTL2(PIPE_A)));
+		       vdsc_instances_per_pipe, dw[0], rc, cb->readReg32(ICL_PIPE_DSS_CTL1(PIPE_A)), cb->readReg32(ICL_PIPE_DSS_CTL2(PIPE_A)));
 }
 
-static void vdscEnable(void *path) {
+static void vdscEnable(const void *controller, void *path) {
 	auto *cb = NGreen::callback;
 	if (cb == nullptr || cb->getIsRealTGL() || path == nullptr || gVdscRouted != 3u || !cb->mmioMapped()) return;
 	void *port = getMember<void *>(path, kVdscPathPort);
@@ -1696,7 +1781,7 @@ static void vdscEnable(void *path) {
 		return;
 	}
 	if (!latchOn || !portOn || pipe != 0u) return;
-	intel_dsc_enable(gVdscLatchDw);
+	intel_dsc_enable(gVdscLatchDw, controller);
 	gVdscFlushPath = path;
 	gVdscFlushed = 1;
 }
@@ -3967,7 +4052,37 @@ void Gen11::setupDSCEngineParams(AppleIntel::AppleIntelBaseController *that,
 	if (NGreen::callback != nullptr && !NGreen::callback->isRealTGL && !NGreen::callback->isRaptorLakeHX() && gTGLFbBase != 0)
 		*(volatile uint64_t *)(gTGLFbBase + 0x1c2b90) = 1;
 
+	// The panel's 240 Hz timing (and its scaled twins, 1 148 920 000 Hz) runs only with DSC, above the 720 MHz the framebuffer
+	// accepts without it. setupDSCEngineParams is the modeset's reader of the EnableDSC, DSCSliceValue and DSCSliceHeight debug
+	// variables (the diagnostics' isDSCSupported reads EnableDSC too): open the first with 4 slices of half the vertical active
+	// (DSC 1.1 as i915 drives this panel; a height of 0 means one slice row of the whole height) for this one call, and restore
+	// all three, so a 60 Hz modeset is Apple's.
+	volatile uint64_t *dscGate = nullptr, *dscSlices = nullptr, *dscHeight = nullptr;
+	uint64_t slicesWas = 0, heightWas = 0;
+	if (NGreen::callback != nullptr && NGreen::callback->isRaptorLakeHX() && gTGLFbBase != 0 && timing != nullptr &&
+	    timing->pixelClock > 720000000ull) {
+		dscGate = reinterpret_cast<volatile uint64_t *>(gTGLFbBase + 0x1c2b90);
+		dscSlices = reinterpret_cast<volatile uint64_t *>(gTGLFbBase + 0x1c2b78);
+		dscHeight = reinterpret_cast<volatile uint64_t *>(gTGLFbBase + 0x1c2b80);
+		if (*dscGate == 0) {
+			slicesWas = *dscSlices;
+			heightWas = *dscHeight;
+			*dscSlices = 4;
+			if (heightWas == 0 && timing->verticalActive >= 16 && (timing->verticalActive & 1) == 0)
+				*dscHeight = timing->verticalActive / 2;
+			*dscGate = 1;
+		} else {
+			dscGate = nullptr;
+		}
+	}
+
 	FunctionCast(setupDSCEngineParams, callback->osetupDSCEngineParams)(that, fb, params, path, timing);
+
+	if (dscGate != nullptr) {
+		*dscGate = 0;
+		*dscSlices = slicesWas;
+		*dscHeight = heightWas;
+	}
 
 	if (NGreen::callback == nullptr || NGreen::callback->isRealTGL || params == nullptr) return;
 
@@ -3977,7 +4092,7 @@ void Gen11::setupDSCEngineParams(AppleIntel::AppleIntelBaseController *that,
 void Gen11::wrapEnableDSCEngine(AppleIntel::AppleIntelBaseController *that, AppleIntel::AppleIntelFramebuffer *fb,
                                 AppleIntel::AppleIntelDisplayPath *path)
 {
-	vdscEnable(path);
+	vdscEnable(that, path);
 	FunctionCast(wrapEnableDSCEngine, callback->oEnableDSCEngine)(that, fb, path);
 }
 
