@@ -344,6 +344,40 @@ static const uint8_t kTGLGLCompilerDeviceIdRepl[] = {
 static_assert(sizeof(kTGLGLCompilerDeviceIdFind) == sizeof(kTGLGLCompilerDeviceIdRepl) && sizeof(kTGLGLCompilerDeviceIdFind) == 14,
     "patch must not change the byte length - re-derive it from the TGL GL driver 16.0.32");
 
+//! The OpenCL compiler plug-in (`libCLVMIGCPlugin.dylib`, loaded by the cvms compiler service) builds a platform for
+//! IGC only for Gen9 and Ice Lake ids: `compileToDeviceBinary` sends every other id through `Is_Gen11_LP (id << 16 | 0x8086)`
+//! and answers "Invalid Device.", so no OpenCL kernel ever compiled for this GPU although libigc itself knows gen12lp.
+//! Open the gate (the function's preset answer is already `true`) and give the platform it then fills the values the
+//! TGL GL driver uses for its own compiler: eProductFamily IGFX_TIGERLAKE_LP (0x21), display and render core
+//! IGFX_GEN12_CORE (0x11). Derived from the plug-in in 24G231; both sites are in one page.
+static const char kCLIGCPluginPath[] = "/OpenCL.framework/Versions/A/Libraries/libCLVMIGCPlugin.dylib";
+static const uint8_t kCLIGCGen11GateFind[] = {
+    0xB0, 0x01,                                  // movb $1, %al
+    0x81, 0xFF, 0x85, 0x80, 0x5B, 0x8A,          // cmpl $0x8a5b8085, %edi  (Is_Gen11_LP's first compare)
+    0x7E, 0x22,                                  // jle
+};
+static const uint8_t kCLIGCGen11GateRepl[] = {
+    0xB0, 0x01,                                  // movb $1, %al
+    0x5D, 0xC3,                                  // popq %rbp; retq
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+};
+static_assert(sizeof(kCLIGCGen11GateFind) == sizeof(kCLIGCGen11GateRepl) && sizeof(kCLIGCGen11GateFind) == 10,
+    "patch must not change the byte length - re-derive it from libCLVMIGCPlugin.dylib");
+static const uint8_t kCLIGCPlatformFind[] = {
+    0xC7, 0x45, 0xB0, 0x1D, 0x00, 0x00, 0x00,    // movl $IGFX_ICELAKE_LP, eProductFamily
+    0xC7, 0x45, 0xB8, 0x0F, 0x00, 0x00, 0x00,    // movl $IGFX_GEN11_CORE, eDisplayCoreFamily
+    0x41, 0x8B, 0x7D, 0x08,                      // movl 8(%r13), %edi      (the device id for usDeviceID)
+    0xB8, 0x0F, 0x00, 0x00, 0x00,                // movl $IGFX_GEN11_CORE, %eax -> eRenderCoreFamily
+};
+static const uint8_t kCLIGCPlatformRepl[] = {
+    0xC7, 0x45, 0xB0, 0x21, 0x00, 0x00, 0x00,    // IGFX_TIGERLAKE_LP
+    0xC7, 0x45, 0xB8, 0x11, 0x00, 0x00, 0x00,    // IGFX_GEN12_CORE
+    0x41, 0x8B, 0x7D, 0x08,
+    0xB8, 0x11, 0x00, 0x00, 0x00,                // IGFX_GEN12_CORE
+};
+static_assert(sizeof(kCLIGCPlatformFind) == sizeof(kCLIGCPlatformRepl) && sizeof(kCLIGCPlatformFind) == 23,
+    "patch must not change the byte length - re-derive it from libCLVMIGCPlugin.dylib");
+
 static const uint8_t kIGCRtIgcHSW64PathOriginal[] = {
     0x2F, 0x53, 0x79, 0x73, 0x74, 0x65, 0x6D, 0x2F, 0x4C, 0x69, 0x62, 0x72,
     0x61, 0x72, 0x79, 0x2F, 0x45, 0x78, 0x74, 0x65, 0x6E, 0x73, 0x69, 0x6F,

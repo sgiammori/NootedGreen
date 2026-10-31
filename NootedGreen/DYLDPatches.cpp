@@ -110,6 +110,19 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			return;
 		}
 
+		if (strstr(path, kCLIGCPluginPath) != nullptr) {
+			if (IS_RAPTOR_LAKE_HX()) {
+				bool gate = KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kCLIGCGen11GateFind, arrsize(kCLIGCGen11GateFind),
+					kCLIGCGen11GateRepl, arrsize(kCLIGCGen11GateRepl));
+				bool platform = KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kCLIGCPlatformFind, arrsize(kCLIGCPlatformFind),
+					kCLIGCPlatformRepl, arrsize(kCLIGCPlatformRepl));
+				if (gate || platform)
+					SYSLOG("DYLD", "OpenCL: IGC plug-in gate %s, platform %s (Tiger Lake 0x21, Gen12 core 0x11)",
+						gate ? "opened" : "unchanged", platform ? "set" : "unchanged");
+			}
+			return;
+		}
+
 		if (strstr(path, kIGCPluginBundlePath) != nullptr) {
 			if (IS_RAPTOR_LAKE_HX()) {
 				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kLibLLVMDepOriginal, arrsize(kLibLLVMDepOriginal),
