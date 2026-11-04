@@ -59,6 +59,21 @@ static KernelPatcher::KextInfo kextG11HWTA {"com.apple.driver.AppleIntelTGLGraph
 
 Gen11 *Gen11::callback = nullptr;
 
+// ─── XE-NVRAM (IdeaPad 14IAH8, 2026-11-04): no "saved-config" NVRAM write from the FB ──────────────────────────
+// When the display idles, IOFramebuffer::checkPowerWork -> setFramebufferPowerState -> prepareToExitWake ->
+// AppleIntelBaseController::hwSaveNVRAM calls IODTPlatformExpert through vtable offset 0x9f8, which is a reserved
+// slot on the Tahoe kernel: panic "IODTPlatformExpert::_RESERVEDIODTPlatformExpert1 called". The "prod" FB patch list
+// already NOPs that call (f20p), but the FB that loads from sle_Internal keeps its symbols, so the debug list is used
+// and the call stays. The blob only speeds up the next boot's modeset, so hwSaveNVRAM now does nothing and reports
+// success. -ngreennvram restores the original.
+static mach_vm_address_t gXeOrgSaveNVRAM = 0;
+static volatile uint32_t gXeSaveNVRAMSkips = 0;
+static IOReturn xeSkipSaveNVRAM(void *that) {
+	(void)that;
+	if (gXeSaveNVRAMSkips++ < 4) IOLog("XeNG NVRAM: hwSaveNVRAM skipped (reserved PlatformExpert slot on Tahoe)\n");
+	return kIOReturnSuccess;
+}
+
 void Gen11::init() {
 	callback = this;
 
@@ -611,6 +626,15 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			};
 			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route d symbols");
 			
+		}
+		// XE-NVRAM: see the top of this file.
+		if (!checkKernelArgument("-ngreennvram")) {
+			RouteRequestPlus nvramRequests[] = {
+				{"__ZN24AppleIntelBaseController11hwSaveNVRAMEv", xeSkipSaveNVRAM, gXeOrgSaveNVRAM},
+			};
+			bool ok = RouteRequestPlus::routeAll(patcher, index, nvramRequests, address, size);
+			if (!ok) patcher.clearError();
+			IOLog("XeNG NVRAM: hook %s\n", ok ? "active" : "FAILED");
 		}
 		
 		//powerwell
