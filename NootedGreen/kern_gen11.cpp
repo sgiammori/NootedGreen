@@ -74,6 +74,27 @@ static IOReturn xeSkipSaveNVRAM(void *that) {
 	return kIOReturnSuccess;
 }
 
+// ─── XE-SWCURSOR (IdeaPad 14IAH8, 2026-11-04): opt-in software cursor (-ngreenswcursor) ────────────────────────
+// On the ADL-H 46A3 (display 13) the TGL FB's hardware cursor shows broken bands: the 64x64 ARGB image in cursor
+// memory is correct (read back through the aperture), CUR_CTL/BASE/POS and the GGTT PTEs are correct, yet a known test
+// image comes out as ~4-row bands every 16 rows with rows from far apart mixed in. Not fixed by a GGTT flush,
+// Wa_22012358565 (cursor ARB slot), raised cursor watermarks or the DBUF min tracker field, and no underrun is flagged:
+// most likely display-13 DBUF/MBUS servicing the TGL driver does not program. With -ngreenswcursor,
+// AppleIntelFramebuffer::getAttribute('crsr') answers 0, so IOFramebuffer does not use the hardware cursor and
+// WindowServer composites the pointer into the frame. Known cost: the pointer occasionally drops for a frame while
+// content updates.
+static mach_vm_address_t gXeOrgFbGetAttribute = 0;
+static IOReturn xeFbGetAttribute(void *that, uint32_t attribute, uintptr_t *value) {
+	auto ret = reinterpret_cast<IOReturn (*)(void *, uint32_t, uintptr_t *)>(gXeOrgFbGetAttribute)(that, attribute, value);
+	if (attribute == 0x63727372u /* 'crsr', kIOHardwareCursorAttribute */ && value) {
+		static volatile uint32_t n = 0;
+		if (n++ < 4) IOLog("XeNG SWCURSOR: hardware cursor disabled (was %lu)\n", (unsigned long)*value);
+		*value = 0;
+		return kIOReturnSuccess;
+	}
+	return ret;
+}
+
 // ─── XE-FBLOG (IdeaPad 14IAH8, 2026-11-03): the Apple FB's own error/warning log on the console ─────────────────
 // The TGL FB reports errors through IntelLog(), which only feeds internal listeners: nothing reaches the console and
 // AppleIntelBaseController::start can return false without saying why. With -ngreenfblog, IntelLogEnabled says yes to
@@ -671,6 +692,15 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			bool ok = RouteRequestPlus::routeAll(patcher, index, nvramRequests, address, size);
 			if (!ok) patcher.clearError();
 			IOLog("XeNG NVRAM: hook %s\n", ok ? "active" : "FAILED");
+		}
+		// XE-SWCURSOR: see the top of this file.
+		if (checkKernelArgument("-ngreenswcursor")) {
+			RouteRequestPlus curRequests[] = {
+				{"__ZN21AppleIntelFramebuffer12getAttributeEjPm", xeFbGetAttribute, gXeOrgFbGetAttribute},
+			};
+			bool ok = RouteRequestPlus::routeAll(patcher, index, curRequests, address, size);
+			if (!ok) patcher.clearError();
+			IOLog("XeNG SWCURSOR: hook %s\n", ok ? "active" : "FAILED");
 		}
 		// XE-FBLOG: see the top of this file. Local FB symbols (t), resolved by Lilu from the symtab.
 		if (checkKernelArgument("-ngreenfblog")) {
