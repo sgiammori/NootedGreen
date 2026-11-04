@@ -74,6 +74,42 @@ static IOReturn xeSkipSaveNVRAM(void *that) {
 	return kIOReturnSuccess;
 }
 
+// ─── XE-FBLOG (IdeaPad 14IAH8, 2026-11-03): the Apple FB's own error/warning log on the console ─────────────────
+// The TGL FB reports errors through IntelLog(), which only feeds internal listeners: nothing reaches the console and
+// AppleIntelBaseController::start can return false without saying why. With -ngreenfblog, IntelLogEnabled says yes to
+// levels 1 (error), 2 (warning) and 8 (info), and IntelLog prints errors/warnings (max 400) and the info messages of
+// cursor functions (name contains "ursor", max 300) with IOLog. Trace (0x10) is untouched. Diagnostic only: nothing
+// is installed without the boot-arg. This is how "Can't create cursor memory" (XE-GMS) was found.
+static mach_vm_address_t gXeOrgIntelLogEnabled = 0, gXeOrgIntelLog = 0;
+static volatile uint32_t gXeFbLogCount = 0, gXeFbLogCurCount = 0;
+static bool xeIsCursorFunc(const char *f) {
+	if (!f) return false;
+	for (; *f; f++)
+		if (f[0] == 'u' && f[1] == 'r' && f[2] == 's' && f[3] == 'o' && f[4] == 'r') return true;
+	return false;
+}
+static bool xeFbLogEnabled(uint32_t level, uint32_t module) {
+	if (level & 0xBu) return true;  // the real filter is in xeFbLog, which sees the function name
+	return gXeOrgIntelLogEnabled ? reinterpret_cast<bool (*)(uint32_t, uint32_t)>(gXeOrgIntelLogEnabled)(level, module) : false;
+}
+static void xeFbLog(uint32_t level, uint32_t module, const char *file, uint32_t line, const char *func, const char *fmt, ...) {
+	(void)file;
+	if (!fmt) return;
+	if (level & 0x3u) {
+		if (gXeFbLogCount >= 400) return;
+		gXeFbLogCount++;
+	} else {
+		if (!xeIsCursorFunc(func) || gXeFbLogCurCount >= 300) return;
+		gXeFbLogCurCount++;
+	}
+	char buf[224];
+	__builtin_va_list va;
+	__builtin_va_start(va, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, va);
+	__builtin_va_end(va);
+	IOLog("IGFB %s m%u %s:%u %s", (level & 1u) ? "ERR" : (level & 2u) ? "WRN" : "INF", module, func ? func : "?", line, buf);
+}
+
 void Gen11::init() {
 	callback = this;
 
@@ -635,6 +671,16 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			bool ok = RouteRequestPlus::routeAll(patcher, index, nvramRequests, address, size);
 			if (!ok) patcher.clearError();
 			IOLog("XeNG NVRAM: hook %s\n", ok ? "active" : "FAILED");
+		}
+		// XE-FBLOG: see the top of this file. Local FB symbols (t), resolved by Lilu from the symtab.
+		if (checkKernelArgument("-ngreenfblog")) {
+			RouteRequestPlus logRequests[] = {
+				{"_IntelLogEnabled", xeFbLogEnabled, gXeOrgIntelLogEnabled},
+				{"_IntelLog", xeFbLog, gXeOrgIntelLog},
+			};
+			bool ok = RouteRequestPlus::routeAll(patcher, index, logRequests, address, size);
+			if (!ok) patcher.clearError();
+			SYSLOG("ngreen", "XE-FBLOG: IntelLog -> IOLog: %s", ok ? "active" : "FAILED");
 		}
 		
 		//powerwell
