@@ -534,6 +534,30 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 uint16_t NGreen::configRead16(IORegistryEntry *service, uint32_t space, uint8_t offset) {
 	if (callback && callback->orgConfigRead16) {
 		auto result = callback->orgConfigRead16(service, space, offset);
+		// XE-GMS: DVMT pre-allocation in 4 MB steps. Many ADL/RPL laptops (e.g. Lenovo IdeaPad Slim 5 14IAH8,
+		// i5-12450H) reserve 60 MB of DSM, so GGC (config 0x50) has GMS = 0xFE (the 0xF0..0xFE = 4..60 MB encoding).
+		// The TGL 16.0.32 drivers only know the 32 MB steps: the FB (FBMemMgr_Init, (GGC << 17) & 0xFE000000) gets
+		// 4032 MB and puts the cursor memory past the 256 MB aperture -> IODeviceMemory::withSubRange returns NULL ->
+		// "Can't create cursor memory" -> AppleIntelBaseController::start() fails -> "Could not register with IOFB",
+		// and the accelerator (IGMemoryManager::initSegments, (GGC & 0xFF00) << 17) gets ~8 GB of stolen memory ->
+		// IGAccelTask::initAllocators fails -> page fault in IOAccelTask::release (CR2 0xc78) at boot.
+		// Show the drivers the real DSM rounded down to 32 MB (60 -> 32, GMS 0x01): everything below is real stolen
+		// memory, the rest stays unused. NootedGreen's own GGC read in processPatcher happens before this hook.
+		// No change when GMS is already in 32 MB steps.
+		if (offset == 0x50 && ((space >> 24) & 0xFu) == 0 && service != nullptr) {
+			auto name = service->getName();
+			uint32_t gms = (result >> 8) & 0xFFu;
+			if (name && name[0] == 'I' && name[1] == 'G' && name[2] == 'P' && name[3] == 'U' && gms >= 0xF0 && gms <= 0xFE) {
+				uint32_t mb = (gms - 0xEFu) * 4u, units = mb / 32u;
+				static volatile uint32_t logged = 0;
+				uint16_t fixed = static_cast<uint16_t>((result & 0x00FFu) | (units << 8));
+				if (!logged) {
+					logged = 1;
+					SYSLOG("ngreen", "XE-GMS: GGC 0x%04x -> 0x%04x (DSM %u MB, %u MB shown to the drivers)", result, units ? fixed : result, mb, units * 32u);
+				}
+				if (units) return fixed;
+			}
+		}
 		if (offset == WIOKit::kIOPCIConfigDeviceID && service != nullptr) {
 			auto name = service->getName();
 			if (name && name[0] == 'I' && name[1] == 'G' && name[2] == 'P' && name[3] == 'U') {

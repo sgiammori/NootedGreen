@@ -59,6 +59,78 @@ static KernelPatcher::KextInfo kextG11HWTA {"com.apple.driver.AppleIntelTGLGraph
 
 Gen11 *Gen11::callback = nullptr;
 
+// ─── XE-NVRAM (IdeaPad 14IAH8, 2026-11-04): no "saved-config" NVRAM write from the FB ──────────────────────────
+// When the display idles, IOFramebuffer::checkPowerWork -> setFramebufferPowerState -> prepareToExitWake ->
+// AppleIntelBaseController::hwSaveNVRAM calls IODTPlatformExpert through vtable offset 0x9f8, which is a reserved
+// slot on the Tahoe kernel: panic "IODTPlatformExpert::_RESERVEDIODTPlatformExpert1 called". The "prod" FB patch list
+// already NOPs that call (f20p), but the FB that loads from sle_Internal keeps its symbols, so the debug list is used
+// and the call stays. The blob only speeds up the next boot's modeset, so hwSaveNVRAM now does nothing and reports
+// success. -ngreennvram restores the original.
+static mach_vm_address_t gXeOrgSaveNVRAM = 0;
+static volatile uint32_t gXeSaveNVRAMSkips = 0;
+static IOReturn xeSkipSaveNVRAM(void *that) {
+	(void)that;
+	if (gXeSaveNVRAMSkips++ < 4) IOLog("XeNG NVRAM: hwSaveNVRAM skipped (reserved PlatformExpert slot on Tahoe)\n");
+	return kIOReturnSuccess;
+}
+
+// ─── XE-SWCURSOR (IdeaPad 14IAH8, 2026-11-04): opt-in software cursor (-ngreenswcursor) ────────────────────────
+// On the ADL-H 46A3 (display 13) the TGL FB's hardware cursor shows broken bands: the 64x64 ARGB image in cursor
+// memory is correct (read back through the aperture), CUR_CTL/BASE/POS and the GGTT PTEs are correct, yet a known test
+// image comes out as ~4-row bands every 16 rows with rows from far apart mixed in. Not fixed by a GGTT flush,
+// Wa_22012358565 (cursor ARB slot), raised cursor watermarks or the DBUF min tracker field, and no underrun is flagged:
+// most likely display-13 DBUF/MBUS servicing the TGL driver does not program. With -ngreenswcursor,
+// AppleIntelFramebuffer::getAttribute('crsr') answers 0, so IOFramebuffer does not use the hardware cursor and
+// WindowServer composites the pointer into the frame. Known cost: the pointer occasionally drops for a frame while
+// content updates.
+static mach_vm_address_t gXeOrgFbGetAttribute = 0;
+static IOReturn xeFbGetAttribute(void *that, uint32_t attribute, uintptr_t *value) {
+	auto ret = reinterpret_cast<IOReturn (*)(void *, uint32_t, uintptr_t *)>(gXeOrgFbGetAttribute)(that, attribute, value);
+	if (attribute == 0x63727372u /* 'crsr', kIOHardwareCursorAttribute */ && value) {
+		static volatile uint32_t n = 0;
+		if (n++ < 4) IOLog("XeNG SWCURSOR: hardware cursor disabled (was %lu)\n", (unsigned long)*value);
+		*value = 0;
+		return kIOReturnSuccess;
+	}
+	return ret;
+}
+
+// ─── XE-FBLOG (IdeaPad 14IAH8, 2026-11-03): the Apple FB's own error/warning log on the console ─────────────────
+// The TGL FB reports errors through IntelLog(), which only feeds internal listeners: nothing reaches the console and
+// AppleIntelBaseController::start can return false without saying why. With -ngreenfblog, IntelLogEnabled says yes to
+// levels 1 (error), 2 (warning) and 8 (info), and IntelLog prints errors/warnings (max 400) and the info messages of
+// cursor functions (name contains "ursor", max 300) with IOLog. Trace (0x10) is untouched. Diagnostic only: nothing
+// is installed without the boot-arg. This is how "Can't create cursor memory" (XE-GMS) was found.
+static mach_vm_address_t gXeOrgIntelLogEnabled = 0, gXeOrgIntelLog = 0;
+static volatile uint32_t gXeFbLogCount = 0, gXeFbLogCurCount = 0;
+static bool xeIsCursorFunc(const char *f) {
+	if (!f) return false;
+	for (; *f; f++)
+		if (f[0] == 'u' && f[1] == 'r' && f[2] == 's' && f[3] == 'o' && f[4] == 'r') return true;
+	return false;
+}
+static bool xeFbLogEnabled(uint32_t level, uint32_t module) {
+	if (level & 0xBu) return true;  // the real filter is in xeFbLog, which sees the function name
+	return gXeOrgIntelLogEnabled ? reinterpret_cast<bool (*)(uint32_t, uint32_t)>(gXeOrgIntelLogEnabled)(level, module) : false;
+}
+static void xeFbLog(uint32_t level, uint32_t module, const char *file, uint32_t line, const char *func, const char *fmt, ...) {
+	(void)file;
+	if (!fmt) return;
+	if (level & 0x3u) {
+		if (gXeFbLogCount >= 400) return;
+		gXeFbLogCount++;
+	} else {
+		if (!xeIsCursorFunc(func) || gXeFbLogCurCount >= 300) return;
+		gXeFbLogCurCount++;
+	}
+	char buf[224];
+	__builtin_va_list va;
+	__builtin_va_start(va, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, va);
+	__builtin_va_end(va);
+	IOLog("IGFB %s m%u %s:%u %s", (level & 1u) ? "ERR" : (level & 2u) ? "WRN" : "INF", module, func ? func : "?", line, buf);
+}
+
 void Gen11::init() {
 	callback = this;
 
@@ -611,6 +683,34 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			};
 			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route d symbols");
 			
+		}
+		// XE-NVRAM: see the top of this file.
+		if (!checkKernelArgument("-ngreennvram")) {
+			RouteRequestPlus nvramRequests[] = {
+				{"__ZN24AppleIntelBaseController11hwSaveNVRAMEv", xeSkipSaveNVRAM, gXeOrgSaveNVRAM},
+			};
+			bool ok = RouteRequestPlus::routeAll(patcher, index, nvramRequests, address, size);
+			if (!ok) patcher.clearError();
+			IOLog("XeNG NVRAM: hook %s\n", ok ? "active" : "FAILED");
+		}
+		// XE-SWCURSOR: see the top of this file.
+		if (checkKernelArgument("-ngreenswcursor")) {
+			RouteRequestPlus curRequests[] = {
+				{"__ZN21AppleIntelFramebuffer12getAttributeEjPm", xeFbGetAttribute, gXeOrgFbGetAttribute},
+			};
+			bool ok = RouteRequestPlus::routeAll(patcher, index, curRequests, address, size);
+			if (!ok) patcher.clearError();
+			IOLog("XeNG SWCURSOR: hook %s\n", ok ? "active" : "FAILED");
+		}
+		// XE-FBLOG: see the top of this file. Local FB symbols (t), resolved by Lilu from the symtab.
+		if (checkKernelArgument("-ngreenfblog")) {
+			RouteRequestPlus logRequests[] = {
+				{"_IntelLogEnabled", xeFbLogEnabled, gXeOrgIntelLogEnabled},
+				{"_IntelLog", xeFbLog, gXeOrgIntelLog},
+			};
+			bool ok = RouteRequestPlus::routeAll(patcher, index, logRequests, address, size);
+			if (!ok) patcher.clearError();
+			SYSLOG("ngreen", "XE-FBLOG: IntelLog -> IOLog: %s", ok ? "active" : "FAILED");
 		}
 		
 		//powerwell
