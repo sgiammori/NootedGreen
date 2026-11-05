@@ -123,6 +123,16 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			return;
 		}
 
+		if (strstr(path, kTGLVADriverPath) != nullptr) {
+			if (IS_RAPTOR_LAKE_HX()) {
+				for (const auto &patch : kTGLVADriverPatches) {
+					if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, patch.find, patch.size, patch.repl, patch.size))
+						SYSLOG("DYLD", "VA plug-in: %s patched", patch.name);
+				}
+			}
+			return;
+		}
+
 		if (strstr(path, kIGCPluginBundlePath) != nullptr) {
 			if (IS_RAPTOR_LAKE_HX()) {
 				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kLibLLVMDepOriginal, arrsize(kLibLLVMDepOriginal),
