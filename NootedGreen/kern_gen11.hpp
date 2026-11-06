@@ -1562,6 +1562,9 @@ private:
 	mach_vm_address_t orgPavpSessionCallback {};
 	static IOReturn wrapPavpCommandCallbackObj(void *intelAccelerator, OSObject *owner, int32_t sessionCommand, uint32_t sessionAppId, uint32_t *a4);
 	mach_vm_address_t orgPavpCommandCallbackObj {};
+	// V429: the DRM-session restore at the wait when the framebuffer has no ME client
+	static void wrapWaitForDRMSessionRestore(void *that);
+	static void routeV429(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
 	
 	// CSR = DMC firmware patch data pointers (stepping-specific)
 	const uint8_t *_CSR_PATCH_B0plus;  // B0+ stepping
