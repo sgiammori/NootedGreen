@@ -530,7 +530,7 @@ static void patchResolveEop(mach_vm_address_t address, size_t size) {
 
 static const uint8_t kTileFlushPre[] = {0x48, 0xb8, 0x04, 0x00, 0x00, 0x7a, 0x00, 0x50, 0x10, 0x00};
 static constexpr uint32_t kTileFlushPatchAt = 9;
-static constexpr uint8_t kTileFlushPost = 0x10;
+static constexpr uint8_t kTileFlushPost = PIPE_CONTROL_TILE_CACHE_FLUSH >> 24;
 
 static void patchTileFlush(mach_vm_address_t address, size_t size) {
 	uint8_t post[sizeof(kTileFlushPre)];
