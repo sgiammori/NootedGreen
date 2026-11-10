@@ -1054,9 +1054,9 @@ static mach_vm_address_t gBlit3DSupported = 0;
 static constexpr uint32_t kPageonSlotTestEvent = 0x190, kPageonStepUs = 5, kPageonMaxUs = 30000, kPageonAutoOffRun = 8;
 enum : uint32_t { kPageonNotRouted = 0, kPageonRouted, kPageonRouteFailed };
 static mach_vm_address_t gEventMachineVtbl = 0;
-static mach_vm_address_t gAccelPavpCommand = 0;  // V429: IntelAccelerator::PAVPCommandCallback
-static mach_vm_address_t gOrgWaitDrmRestore = 0;  // V429: IntelAccelerator::waitForDRMSessionRestore
-static volatile SInt32 gV429Imei = 0, gV429Rows = 0;  // IMEI: 0 not looked up, 1 absent, 2 present
+static mach_vm_address_t gAccelPavpCommand = 0;  // IntelAccelerator::PAVPCommandCallback
+static mach_vm_address_t gOrgWaitDrmRestore = 0;  // IntelAccelerator::waitForDRMSessionRestore
+static volatile SInt32 gPxpComponent = 0, gPxpResumeRows = 0;  // IMEI: 0 not looked up, 1 absent, 2 present
 static volatile uint32_t gPageonState = kPageonNotRouted, gPageonActive = 0, gPageonAutoOff = 0;
 static volatile uint32_t gPageonTimeoutRun = 0;
 
@@ -3417,8 +3417,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			else
 				patcher.clearError();
 		}
-		// V429: see wrapWaitForDRMSessionRestore (its own frame: processKext's code stays as it was).
-		routeV429(patcher, index, address, size);
+		routePxpResumeComplete(patcher, index, address, size);
 		{
 			RouteRequestPlus renderExecuteRoute[] = {
 				{"__ZN23IntelMTLRenderFunctions7executeEN14IntelMTLRender7eTokensER19IGAccelCommandQueueR26IGAccelSegmentResourceListRK20IOAccelKernelCommandR24IGAccelCommandDescriptorR13IGHeapsAccessR22IOGraphicsAccelerator2R17IGHardwareContextR12IOAccelEvent",
@@ -8274,47 +8273,47 @@ IOReturn Gen11::wrapPavpCommandCallbackObj(void *intelAccelerator, OSObject *own
 	return FunctionCast(wrapPavpCommandCallbackObj, callback->orgPavpCommandCallbackObj)(intelAccelerator, owner, sessionCommand, sessionAppId, a4);
 }
 
-// V429: a system sleep clears the accelerator's DRM-restore flag (+0x1C54) and every video-context submit then waits in
-// waitForDRMSessionRestore (its one caller: IGAccelVideoContext::getTargetAndMethodForIndex, selector 2, before any lock)
-// until PAVP command 6 sets it again. With displays the flag is cleared by systemWillSleep (IOAcceleratorFamily2's
-// display_change_handler, framebuffer event will-sleep), headless by setPowerState(0); command 6 comes only from the
-// framebuffer's ME client (restoreSession), which exists only when a service named IMEI does. Without it no PAVP session
-// can exist and nothing ever sends the command, so the submit sleeps for ever. Complete the restore here, as the ME
-// client would, through the accelerator's own PAVPCommandCallback; an IMEI service keeps Apple's behaviour.
+// From i915, pxp/intel_pxp_pm.c: _pxp_resume (intel_pxp_resume_complete) leaves the session to the mei_pxp component's bind
+// when no component is bound, and nothing waits for it. Apple's accelerator clears its DRM-restore flag (+0x1C54) at a sleep,
+// and every video-context submit then waits in waitForDRMSessionRestore until PAVP command 6 sets it again; the command comes
+// only from the framebuffer's ME client, which exists only when a service named IMEI does. Without one, the restore is
+// completed here through the accelerator's own PAVPCommandCallback, as the ME client would; with one, Apple's path is kept.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/pxp/intel_pxp_pm.c#L37-L63
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/pxp/intel_pxp_types.h#L58-L63
 void Gen11::wrapWaitForDRMSessionRestore(void *that) {
 	if (getMember<uint8_t>(that, 0x1C54) == 0) {
-		if (gV429Imei == 0) {
+		if (gPxpComponent == 0) {
 			OSDictionary *matching = IOService::nameMatching("IMEI");
 			auto *it = matching ? IOService::getMatchingServices(matching) : nullptr;
 			OSSafeReleaseNULL(matching);
 			const bool imei = it != nullptr && it->getNextObject() != nullptr;
 			OSSafeReleaseNULL(it);
-			gV429Imei = imei ? 2 : 1;
-			SYSLOG("ngreen", "V429: DRM restore pending at a submit; IMEI service %s", imei ? "present: Apple's ME client restores" : "absent");
+			gPxpComponent = imei ? 2 : 1;
+			SYSLOG("ngreen", "DRM restore pending at a submit; IMEI service %s", imei ? "present: Apple's ME client restores" : "absent");
 		}
-		if (gV429Imei == 1) {
+		if (gPxpComponent == 1) {
 			using PavpCommandCallback = IOReturn (*)(void *, int32_t, uint32_t, uint32_t *, bool);
 			IOReturn r = reinterpret_cast<PavpCommandCallback>(gAccelPavpCommand)(that, 6, 0, nullptr, true);
-			if (__atomic_fetch_add(&gV429Rows, 1, __ATOMIC_RELAXED) < 16)
-				SYSLOG("ngreen", "V429: no ME client: PAVP command 6 -> 0x%x, restore %s", r,
+			if (__atomic_fetch_add(&gPxpResumeRows, 1, __ATOMIC_RELAXED) < 16)
+				SYSLOG("ngreen", "DRM restore without an ME client: PAVP command 6 -> 0x%x, restore %s", r,
 					getMember<uint8_t>(that, 0x1C54) ? "done" : "STILL PENDING");
 		}
 	}
 	FunctionCast(wrapWaitForDRMSessionRestore, gOrgWaitDrmRestore)(that);
 }
 
-__attribute__((noinline)) void Gen11::routeV429(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+__attribute__((noinline)) void Gen11::routePxpResumeComplete(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	SolveRequestPlus pavpSyms[] = {{"__ZN16IntelAccelerator19PAVPCommandCallbackE22PAVPSessionCommandID_tjPjb", gAccelPavpCommand}};
 	RouteRequestPlus waitRoute[] = {{"__ZN16IntelAccelerator24waitForDRMSessionRestoreEv", wrapWaitForDRMSessionRestore, gOrgWaitDrmRestore}};
 	if (!SolveRequestPlus::solveAll(patcher, index, pavpSyms, address, size)) {
 		patcher.clearError();
 		gAccelPavpCommand = 0;
-		SYSLOG("ngreen", "V429: PAVPCommandCallback not found: waitForDRMSessionRestore not routed");
+		SYSLOG("ngreen", "PAVPCommandCallback not found: waitForDRMSessionRestore not routed");
 	} else if (!RouteRequestPlus::routeAll(patcher, index, waitRoute, address, size)) {
 		patcher.clearError();
-		SYSLOG("ngreen", "V429: waitForDRMSessionRestore not routed: after a sleep every video submit waits");
+		SYSLOG("ngreen", "waitForDRMSessionRestore not routed: after a sleep every video submit waits");
 	} else {
-		SYSLOG("ngreen", "V429: waitForDRMSessionRestore routed");
+		SYSLOG("ngreen", "waitForDRMSessionRestore routed");
 	}
 }
 

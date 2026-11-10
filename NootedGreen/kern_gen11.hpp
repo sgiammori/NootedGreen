@@ -1562,9 +1562,9 @@ private:
 	mach_vm_address_t orgPavpSessionCallback {};
 	static IOReturn wrapPavpCommandCallbackObj(void *intelAccelerator, OSObject *owner, int32_t sessionCommand, uint32_t sessionAppId, uint32_t *a4);
 	mach_vm_address_t orgPavpCommandCallbackObj {};
-	// V429: the DRM-session restore at the wait when the framebuffer has no ME client
+	// PXP resume (i915: intel_pxp_resume_complete) when the framebuffer has no ME client
 	static void wrapWaitForDRMSessionRestore(void *that);
-	static void routeV429(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+	static void routePxpResumeComplete(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
 	
 	// CSR = DMC firmware patch data pointers (stepping-specific)
 	const uint8_t *_CSR_PATCH_B0plus;  // B0+ stepping
@@ -1786,7 +1786,7 @@ private:
 	mach_vm_address_t oConfigureColorPipeLine {};
 
 	// V406: AppleIntelPlane::configurePlane(FlipTransactionArgs*)
-	// Pass-through with logging (kern_gen11.cpp selects V406_APPROACH_DIAGNOSTIC_ONLY).
+	// Pass-through with logging (the diagnostic approach selected in kern_gen11.cpp).
 	static void configurePlane(AppleIntel::AppleIntelPlane *that, AppleIntel::FlipTransactionArgs *flipArgs);
 	mach_vm_address_t oConfigurePlane {};
 
