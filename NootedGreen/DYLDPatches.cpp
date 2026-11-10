@@ -167,6 +167,15 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
     };
     DYLDPatch::applyAll(patches, const_cast<void *>(data), PAGE_SIZE);
 	
+	if (IS_RAPTOR_LAKE_HX() && UNLIKELY(KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kAGVADitherSeiFind,
+			arrsize(kAGVADitherSeiFind), kAGVADitherSeiRepl, arrsize(kAGVADitherSeiRepl)))) {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			SYSLOG("DYLD", "AppleGVA: dither / OOLD SEI ignored (its render-ring post-process hangs on this GPU)");
+		}
+	}
+
 	// ── V50: GPU bundle search path redirect ──
 	// Metal calls gpu_bundle_find_trusted() in libsystem_sandbox.dylib to locate
 	// GPU plugin bundles. This function searches exactly two directories:

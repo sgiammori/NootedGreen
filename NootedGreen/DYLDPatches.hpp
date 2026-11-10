@@ -165,6 +165,36 @@ static const uint8_t kMTLSliceIdNilArchRepl[] = {
 static_assert(sizeof(kMTLSliceIdNilArchFind) == sizeof(kMTLSliceIdNilArchRepl) && sizeof(kMTLSliceIdNilArchFind) == 19,
     "Metal patch must not change the byte length - re-derive it from Metal 368.52");
 
+//! AppleGVA's AVC SEI parser: an Apple user_data_unregistered SEI (UUID 0387f44e-cd0a-4bdc-a194-3ac3d49b171f, or 615ecc3b-c91b-
+//! 4d67-bd64-87694499a07a) asks for a dithering / out-of-loop-deblocking post-process, which AppleGVA schedules as an EU media
+//! kernel on the render ring after the decode; on this GPU that kernel hangs RCS. The two je after the UUID compares become NOPs,
+//! so both UUIDs take the unknown-UUID path (payload skipped, nothing requested) and the frame stays on the video ring; the
+//! decode is then bit-exact with libavcodec, the software decoder differs from it only by the dither's +-1.
+static const uint8_t kAGVADitherSeiFind[] = {
+    0xF3, 0x41, 0x0F, 0x6F, 0x84, 0x24, 0xD4, 0x00, 0x00, 0x00,  // movdqu 0xd4(%r12), %xmm0   (the SEI's UUID)
+    0x66, 0x0F, 0xEF, 0x05, 0x75, 0xF0, 0x0B, 0x00,              // pxor 615ecc3b-...(%rip), %xmm0
+    0x66, 0x0F, 0x38, 0x17, 0xC0,                                // ptest %xmm0, %xmm0
+    0x74, 0x5E,                                                  // je  (dither form 2)
+    0xF3, 0x41, 0x0F, 0x6F, 0x84, 0x24, 0xD4, 0x00, 0x00, 0x00,  // movdqu 0xd4(%r12), %xmm0
+    0x66, 0x0F, 0xEF, 0x05, 0x6C, 0xF0, 0x0B, 0x00,              // pxor 0387f44e-...(%rip), %xmm0
+    0x66, 0x0F, 0x38, 0x17, 0xC0,                                // ptest %xmm0, %xmm0
+    0x74, 0x6D,                                                  // je  (dither / OOLD mode byte)
+    0x41, 0x83, 0xC5, 0xF0,                                      // addl $-0x10, %r13d   (unknown UUID: skip the payload)
+};
+static const uint8_t kAGVADitherSeiRepl[] = {
+    0xF3, 0x41, 0x0F, 0x6F, 0x84, 0x24, 0xD4, 0x00, 0x00, 0x00,
+    0x66, 0x0F, 0xEF, 0x05, 0x75, 0xF0, 0x0B, 0x00,
+    0x66, 0x0F, 0x38, 0x17, 0xC0,
+    0x90, 0x90,
+    0xF3, 0x41, 0x0F, 0x6F, 0x84, 0x24, 0xD4, 0x00, 0x00, 0x00,
+    0x66, 0x0F, 0xEF, 0x05, 0x6C, 0xF0, 0x0B, 0x00,
+    0x66, 0x0F, 0x38, 0x17, 0xC0,
+    0x90, 0x90,
+    0x41, 0x83, 0xC5, 0xF0,
+};
+static_assert(sizeof(kAGVADitherSeiFind) == sizeof(kAGVADitherSeiRepl) && sizeof(kAGVADitherSeiFind) == 54,
+    "AppleGVA patch must not change the byte length - re-derive it from AppleGVA 24G231");
+
 static const uint8_t kTGLMTLClipRasterFlagFind[] = {
     0xF6, 0x80, 0xD0, 0x00, 0x00, 0x00, 0x04,
     0x75, 0x20,
