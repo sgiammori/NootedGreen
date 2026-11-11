@@ -68,6 +68,85 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	}
 
     if (!UserPatcher::matchSharedCachePath(path)) {
+		if (strstr(path, kTGLMetalDriverPath) != nullptr) {
+			if (IS_RAPTOR_LAKE_HX()) {
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kIGCPluginPathOriginal, arrsize(kIGCPluginPathOriginal),
+					kIGCPluginPathPatched, arrsize(kIGCPluginPathPatched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kMetalDescVfVertexDesc1Original, arrsize(kMetalDescVfVertexDesc1Original),
+					kMetalDescVfVertexDesc1Patched, arrsize(kMetalDescVfVertexDesc1Patched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kMetalDescVfVertexDesc2Original, arrsize(kMetalDescVfVertexDesc2Original),
+					kMetalDescVfVertexDesc2Patched, arrsize(kMetalDescVfVertexDesc2Patched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kMetalDescSmFragmentFuncOriginal, arrsize(kMetalDescSmFragmentFuncOriginal),
+					kMetalDescSmFragmentFuncPatched, arrsize(kMetalDescSmFragmentFuncPatched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kMetalDescWmFragmentFuncOriginal, arrsize(kMetalDescWmFragmentFuncOriginal),
+					kMetalDescWmFragmentFuncPatched, arrsize(kMetalDescWmFragmentFuncPatched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLClipRasterFlagFind, arrsize(kTGLMTLClipRasterFlagFind),
+					kTGLMTLClipRasterFlagRepl, arrsize(kTGLMTLClipRasterFlagRepl));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLClipGLModeFlagFind, arrsize(kTGLMTLClipGLModeFlagFind),
+					kTGLMTLClipGLModeFlagRepl, arrsize(kTGLMTLClipGLModeFlagRepl));
+			}
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLWmRasterFlagFind, arrsize(kTGLMTLWmRasterFlagFind),
+				kTGLMTLWmRasterFlagRepl, arrsize(kTGLMTLWmRasterFlagRepl));
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLWmGLModeFlagFind, arrsize(kTGLMTLWmGLModeFlagFind),
+				kTGLMTLWmGLModeFlagRepl, arrsize(kTGLMTLWmGLModeFlagRepl));
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLPoshAfterPsoFind, arrsize(kTGLMTLPoshAfterPsoFind),
+				kTGLMTLPoshAfterPsoRepl, arrsize(kTGLMTLPoshAfterPsoRepl));
+			for (const auto &fix : kTGLMTLStaleDescFixes)
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, fix.find, fix.len, fix.repl, fix.len);
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLBlitUrbFind, arrsize(kTGLMTLBlitUrbFind),
+				kTGLMTLBlitUrbRepl, arrsize(kTGLMTLBlitUrbRepl));
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLBlit3DFind, arrsize(kTGLMTLBlit3DFind),
+				kTGLMTLBlit3DRepl, arrsize(kTGLMTLBlit3DRepl));
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLNo2DFind, arrsize(kTGLMTLNo2DFind),
+				kTGLMTLNo2DRepl, arrsize(kTGLMTLNo2DRepl));
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLMTLClearStoreFind, arrsize(kTGLMTLClearStoreFind),
+				kTGLMTLClearStoreRepl, arrsize(kTGLMTLClearStoreRepl));
+			return;
+		}
+
+		if (strstr(path, kTGLGLDriverPath) != nullptr) {
+			KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kTGLGLCompilerDeviceIdFind, arrsize(kTGLGLCompilerDeviceIdFind),
+				kTGLGLCompilerDeviceIdRepl, arrsize(kTGLGLCompilerDeviceIdRepl));
+			return;
+		}
+
+		if (strstr(path, kCLIGCPluginPath) != nullptr) {
+			if (IS_RAPTOR_LAKE_HX()) {
+				bool gate = KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kCLIGCGen11GateFind, arrsize(kCLIGCGen11GateFind),
+					kCLIGCGen11GateRepl, arrsize(kCLIGCGen11GateRepl));
+				bool platform = KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kCLIGCPlatformFind, arrsize(kCLIGCPlatformFind),
+					kCLIGCPlatformRepl, arrsize(kCLIGCPlatformRepl));
+				if (gate || platform)
+					SYSLOG("DYLD", "OpenCL: IGC plug-in gate %s, platform %s (Tiger Lake 0x21, Gen12 core 0x11)",
+						gate ? "opened" : "unchanged", platform ? "set" : "unchanged");
+			}
+			return;
+		}
+
+		if (strstr(path, kTGLVADriverPath) != nullptr) {
+			if (IS_RAPTOR_LAKE_HX()) {
+				for (const auto &patch : kTGLVADriverPatches) {
+					if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, patch.find, patch.size, patch.repl, patch.size))
+						SYSLOG("DYLD", "VA plug-in: %s patched", patch.name);
+				}
+			}
+			return;
+		}
+
+		if (strstr(path, kIGCPluginBundlePath) != nullptr) {
+			if (IS_RAPTOR_LAKE_HX()) {
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kLibLLVMDepOriginal, arrsize(kLibLLVMDepOriginal),
+					kLibLLVMDepPatched, arrsize(kLibLLVMDepPatched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kIGCRtTGLGpuencodePathOriginal, arrsize(kIGCRtTGLGpuencodePathOriginal),
+					kIGCRtTGLGpuencodePathPatched, arrsize(kIGCRtTGLGpuencodePathPatched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kIGCRtIgc64PathOriginal, arrsize(kIGCRtIgc64PathOriginal),
+					kIGCRtIgc64PathPatched, arrsize(kIGCRtIgc64PathPatched));
+				KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kIGCRtIgcHSW64PathOriginal, arrsize(kIGCRtIgcHSW64PathOriginal),
+					kIGCRtIgcHSW64PathPatched, arrsize(kIGCRtIgcHSW64PathPatched));
+			}
+			return;
+		}
+
         if (LIKELY(strncmp(path, kCoreLSKDMSEPath, arrsize(kCoreLSKDMSEPath))) ||
             LIKELY(strncmp(path, kCoreLSKDPath, arrsize(kCoreLSKDPath)))) {
             return;
@@ -88,6 +167,15 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
     };
     DYLDPatch::applyAll(patches, const_cast<void *>(data), PAGE_SIZE);
 	
+	if (IS_RAPTOR_LAKE_HX() && UNLIKELY(KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kAGVADitherSeiFind,
+			arrsize(kAGVADitherSeiFind), kAGVADitherSeiRepl, arrsize(kAGVADitherSeiRepl)))) {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			SYSLOG("DYLD", "AppleGVA: dither / OOLD SEI ignored (its render-ring post-process hangs on this GPU)");
+		}
+	}
+
 	// ── V50: GPU bundle search path redirect ──
 	// Metal calls gpu_bundle_find_trusted() in libsystem_sandbox.dylib to locate
 	// GPU plugin bundles. This function searches exactly two directories:
@@ -174,6 +262,11 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 		SYSLOG("DYLD", "V50: Applied ICL Metal device-ID bypass (f2, mask-based)");
 	}
 	
+	if (IS_RAPTOR_LAKE_HX())
+		KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kMTLSerializeForDonorFind,
+			arrsize(kMTLSerializeForDonorFind), kMTLSerializeForDonorRepl, arrsize(kMTLSerializeForDonorRepl));
+	KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kMTLSliceIdNilArchFind,
+		arrsize(kMTLSliceIdNilArchFind), kMTLSliceIdNilArchRepl, arrsize(kMTLSliceIdNilArchRepl));
 	// Stage-3 Metal (hardcoded): assertion bypass + RunFullDisplayPipe NULL-guard
 	// + GetMTLTexture/CQ stubs. AccessComplete is live (not skipped).
 

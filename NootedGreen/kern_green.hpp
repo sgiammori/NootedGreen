@@ -72,23 +72,44 @@ class NGreen {
 	mach_vm_address_t orgApplePanelSetDisplay {0};
 	static bool wrapApplePanelSetDisplay(IOService *that, IODisplay *display);
 	
+	mach_vm_address_t orgSbEvaluateInternal {0};
+	static uint64_t wrapSbEvaluateInternal(void *label, uint32_t operation, void *context, void *block);
+	int (*orgVnGetPath)(void *vp, char *pathbuf, int *len) {nullptr};
+	static bool isUnderGpuBundles(void *vp);
+	mach_vm_address_t orgFileCheckLibraryValidation {0};
+	static int wrapFileCheckLibraryValidation(void *proc, void *fileglob, uint64_t sliceOffset,
+		uint64_t errMsg, uint64_t errMsgSize);
+	void *(*orgFgGetVnode)(void *fileglob) {nullptr};
+
 	UInt32 stolen_size;
 	uint32_t framebufferId {0};
 	
+	bool mmioMapped() const { return rmmio != nullptr && rmmioPtr != nullptr; }
+
 	// Public MMIO register access (used by display link training, display merge, etc.)
 	UInt32 readReg32(unsigned long reg) {
-		if (!rmmio || !rmmioPtr) return 0;
-		if (reg + sizeof(uint32_t) <= this->rmmio->getLength()) {
-			return this->rmmioPtr[reg >> 2];
+		if (!rmmio || !rmmioPtr || reg > 0xFFFFFFFFUL) return 0;
+		const uint32_t reg32 = static_cast<uint32_t>(reg);
+		const uint64_t length = this->rmmio->getLength();
+		const bool indexed = !(reg <= length && sizeof(uint32_t) <= length - reg);
+		const bool locked = this->mmioLock != nullptr;
+		IOInterruptState irq = 0;
+		if (locked) irq = IOSimpleLockLockDisableInterrupt(this->mmioLock);
+		UInt32 v;
+		if (!indexed) {
+			v = this->rmmioPtr[reg >> 2];
 		} else {
-			this->rmmioPtr[mmPCIE_INDEX2] = reg;
-			return this->rmmioPtr[mmPCIE_DATA2];
+			this->rmmioPtr[mmPCIE_INDEX2] = reg32;
+			v = this->rmmioPtr[mmPCIE_DATA2];
 		}
+		if (locked) IOSimpleLockUnlockEnableInterrupt(this->mmioLock, irq);
+		return v;
 	}
 
 	// reg = byte offset (i915 convention). rmmioPtr is uint32_t* so divide by 4.
 	void writeReg32(unsigned long reg, UInt32 val) {
-		if (!rmmio || !rmmioPtr) return;
+		if (!rmmio || !rmmioPtr || reg > 0xFFFFFFFFUL) return;
+		const uint32_t reg32 = static_cast<uint32_t>(reg);
 		static int v93MmioLogCount = 0;
 
 		// Safety guard: prevent enabled display planes from being armed with SURF=0.
@@ -119,26 +140,46 @@ class NGreen {
 			}
 		}
 
-		if (reg + sizeof(uint32_t) <= this->rmmio->getLength()) {
+		const uint64_t length = this->rmmio->getLength();
+		const bool indexed = !(reg <= length && sizeof(uint32_t) <= length - reg);
+		const bool locked = this->mmioLock != nullptr;
+		IOInterruptState irq = 0;
+		if (locked) irq = IOSimpleLockLockDisableInterrupt(this->mmioLock);
+		if (!indexed) {
 			this->rmmioPtr[reg >> 2] = val;
 		} else {
-			this->rmmioPtr[mmPCIE_INDEX2] = reg;
+			this->rmmioPtr[mmPCIE_INDEX2] = reg32;
 			this->rmmioPtr[mmPCIE_DATA2] = val;
 		}
+		if (locked) IOSimpleLockUnlockEnableInterrupt(this->mmioLock, irq);
 	}
 	
 	UInt64 readReg64(unsigned long reg) {
-		if (!rmmio || !rmmioPtr) return 0;
-		if (reg * sizeof(uint64_t) < this->rmmio->getLength()) {
-			return this->rmmioPtr[reg];
+		if (!rmmio || !rmmioPtr || reg > 0xFFFFFFFBUL) return 0;
+		const uint32_t reg32 = static_cast<uint32_t>(reg);
+		const uint64_t length = this->rmmio->getLength();
+		const bool indexed = !(reg <= length && sizeof(UInt64) <= length - reg);
+		const bool locked = this->mmioLock != nullptr;
+		IOInterruptState irq = 0;
+		if (locked) irq = IOSimpleLockLockDisableInterrupt(this->mmioLock);
+		UInt64 v;
+		if (!indexed) {
+			auto *byteBase = reinterpret_cast<volatile uint8_t *>(this->rmmioPtr);
+			v = *reinterpret_cast<volatile UInt64 *>(byteBase + reg);
 		} else {
-			this->rmmioPtr[mmPCIE_INDEX2] = reg;
-			return this->rmmioPtr[mmPCIE_DATA2];
+			this->rmmioPtr[mmPCIE_INDEX2] = reg32;
+			const uint32_t low = this->rmmioPtr[mmPCIE_DATA2];
+			this->rmmioPtr[mmPCIE_INDEX2] = reg32 + sizeof(uint32_t);
+			const uint32_t high = this->rmmioPtr[mmPCIE_DATA2];
+			v = (static_cast<UInt64>(high) << 32) | low;
 		}
+		if (locked) IOSimpleLockUnlockEnableInterrupt(this->mmioLock, irq);
+		return v;
 	}
 
 	void writeReg64(unsigned long reg, UInt64 val) {
-		if (!rmmio || !rmmioPtr) return;
+		if (!rmmio || !rmmioPtr || reg > 0xFFFFFFFBUL) return;
+		const uint32_t reg32 = static_cast<uint32_t>(reg);
 		static int v93Mmio64LogCount = 0;
 		const bool looksLikePlaneSurf =
 			(reg >= 0x60000 && reg <= 0xBFFFF) &&
@@ -163,19 +204,52 @@ class NGreen {
 				}
 			}
 		}
-		if ((reg * sizeof(uint64_t)) < this->rmmio->getLength()) {
-			this->rmmioPtr[reg] = val;
+		const uint64_t length = this->rmmio->getLength();
+		const bool indexed = !(reg <= length && sizeof(UInt64) <= length - reg);
+		const bool locked = this->mmioLock != nullptr;
+		IOInterruptState irq = 0;
+		if (locked) irq = IOSimpleLockLockDisableInterrupt(this->mmioLock);
+		if (!indexed) {
+			auto *byteBase = reinterpret_cast<volatile uint8_t *>(this->rmmioPtr);
+			*reinterpret_cast<volatile UInt64 *>(byteBase + reg) = val;
+		} else {
+			this->rmmioPtr[mmPCIE_INDEX2] = reg32;
+			this->rmmioPtr[mmPCIE_DATA2] = static_cast<uint32_t>(val);
+			this->rmmioPtr[mmPCIE_INDEX2] = reg32 + sizeof(uint32_t);
+			this->rmmioPtr[mmPCIE_DATA2] = static_cast<uint32_t>(val >> 32);
+		}
+		if (locked) IOSimpleLockUnlockEnableInterrupt(this->mmioLock, irq);
+	}
+	
+	uint32_t intel_de_rmw(uint32_t reg, uint32_t clear, uint32_t set) {
+		if (!rmmio || !rmmioPtr) return 0;
+
+		const bool planeSurf = (reg >= 0x60000 && reg <= 0xBFFFF) && ((reg & 0xFFF) == 0x19C);
+		if (planeSurf) {
+			uint32_t old = readReg32(reg);
+			writeReg32(reg, (old & ~clear) | set);
+			return old;
+		}
+
+		const bool indexed = !(reg + sizeof(uint32_t) <= this->rmmio->getLength());
+		const bool locked = this->mmioLock != nullptr;
+		IOInterruptState irq = 0;
+		if (locked) irq = IOSimpleLockLockDisableInterrupt(this->mmioLock);
+		uint32_t old, val;
+		if (!indexed) {
+			old = this->rmmioPtr[reg >> 2];
+		} else {
+			this->rmmioPtr[mmPCIE_INDEX2] = reg;
+			old = this->rmmioPtr[mmPCIE_DATA2];
+		}
+		val = (old & ~clear) | set;
+		if (!indexed) {
+			this->rmmioPtr[reg >> 2] = val;
 		} else {
 			this->rmmioPtr[mmPCIE_INDEX2] = reg;
 			this->rmmioPtr[mmPCIE_DATA2] = val;
 		}
-	}
-	
-	uint32_t intel_de_rmw(uint32_t reg, uint32_t clear, uint32_t set) {
-		uint32_t old, val;
-		old = readReg32(reg);
-		val = (old & ~clear) | set;
-		writeReg32(reg, val);
+		if (locked) IOSimpleLockUnlockEnableInterrupt(this->mmioLock, irq);
 		return old;
 	}
 
@@ -186,10 +260,7 @@ class NGreen {
 	
 	void whitelist_reg_ext(uint32_t reg, uint32_t flags)
 	{
-		uint32_t old;
-		old = readReg32(reg);
-		old = old | flags;
-		writeReg32(reg, old);
+		intel_de_rmw(reg, 0, flags);
 	}
 	
 	void
@@ -200,17 +271,12 @@ class NGreen {
 
 	void wa_add(uint32_t reg, uint32_t clear, uint32_t set, uint32_t read_mask, bool masked_reg)
 	{
-		uint32_t old, val;
-		
 		if (masked_reg) {
 			/* Keep the enable mask, reset the actual target bits */
 			set &= ~(set >> 16);
 		}
 
-		old = readReg32(reg);
-		val = (old & ~clear) | set;
-		val |= read_mask;
-		writeReg32(reg, val);
+		intel_de_rmw(reg, clear, set | read_mask);
 	}
 	
 	void wa_masked_en(uint32_t reg, uint32_t val)
@@ -282,9 +348,13 @@ class NGreen {
     bool isGen8LPDerivative = false;
     bool isRealTGL = false;  // true if CPU is genuine TGL (model 0x8C/0x8D), false if spoofed (RPL/ADL)
 public:
+	uint64_t bootApertureLen() const { return apertureLen; }
+	IOPCIDevice *gpuDevice() const { return iGPU; }
     bool getIsRealTGL() const { return isRealTGL; }
+	bool isRaptorLakeHX() const { return deviceId == 0xA788; }
 private:
     bool dmcIsAdlp = false;    // true when ADL-P DMC blob was loaded in hwInitializeCState
+	bool dmcDisabled = false;
     void adlpDcExit(const char *caller);
     uint32_t uefiCtl1 {0};    // UEFI-read PWR_WELL CTL1 value saved in hwInitializeCState
     uint32_t cpuModel {0};  // full display model (family_model)
@@ -304,7 +374,11 @@ private:
 	// V507 uses this to re-run the LRCA slot repair on each populateResetRegisterList call.
 	void *lastRCSCtx {nullptr};
 
+	IOSimpleLock *mmioLock {nullptr};
 };
+
+#define IS_RAPTOR_LAKE_HX() (NGreen::callback != nullptr && NGreen::callback->isRaptorLakeHX())
+#define RAPTOR_LAKE_HX_OR(a788, other) (IS_RAPTOR_LAKE_HX() ? (a788) : (other))
 
 //! Change frame-buffer count >= 2 check to >= 1.
 static const UInt8 kAGDPFBCountCheckOriginal[] = {0x02, 0x00, 0x00, 0x83, 0xF8, 0x02};

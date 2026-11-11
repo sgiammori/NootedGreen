@@ -188,9 +188,36 @@ struct PACKED intel_dmc_header_v3 {
 #define DC_STATE_EN			(0x45504)
 #define CLKREQ_POLICY			(0x101038)
 #define  CLKREQ_POLICY_MEM_UP_OVRD	(1 << 1)
+// From i915, drivers/gpu/drm/i915/display/intel_display_regs.h: transcoder A's DDI function control and clock select, and
+// display/intel_display_limits.h: the port numbers.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L2484-L2504
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L2724-L2731
+enum port { PORT_A = 0, PORT_B, PORT_C, PORT_D, PORT_E };
+#define _TRANS_DDI_FUNC_CTL_A		0x60400
+#define  TRANS_DDI_FUNC_ENABLE		(1 << 31)
+#define  TGL_TRANS_DDI_PORT_SHIFT	27
+#define  TGL_TRANS_DDI_PORT_MASK	(0xf << TGL_TRANS_DDI_PORT_SHIFT)
+#define  TGL_TRANS_DDI_SELECT_PORT(x)	(((x) + 1) << TGL_TRANS_DDI_PORT_SHIFT)
+#define  TRANS_DDI_MODE_SELECT_MASK	(7 << 24)
+#define  TRANS_DDI_MODE_SELECT_DP_SST	(2 << 24)
+#define _TRANS_CLK_SEL_A		0x46140
+#define  TGL_TRANS_CLK_SEL_DISABLED	(0x0 << 28)
+#define  TGL_TRANS_CLK_SEL_PORT(x)	(((x) + 1) << 28)
+// DP_TP_CTL of a display-12 transcoder: i915's TGL_DP_TP_CTL(display, tran) is _MMIO_TRANS2(display, tran, _TGL_DP_TP_CTL_A), the
+// transcoders TRANSCODER_B_OFFSET - TRANSCODER_A_OFFSET apart (display/intel_display_device.c). IntelDPLinkTraining.hpp already names
+// the base TGL_DP_TP_CTL_A and the bit DP_TP_CTL_ENHANCED_FRAME_ENABLE, and holds TGL_DP_TP_CTL() for a per-port form, so the
+// per-transcoder form is written with _MMIO_TRANS2.
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L2560-L2573
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_reg_defs.h#L74
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_device.c#L96-L97
+#define TRANSCODER_A_OFFSET 0x60000
+#define TRANSCODER_B_OFFSET 0x61000
+#define _MMIO_TRANS2(trans, reg)	((reg) + (trans) * (TRANSCODER_B_OFFSET - TRANSCODER_A_OFFSET))
 #define GEN11_COMMON_SLICE_CHICKEN3		(0x7304)
 #define   GEN12_DISABLE_CPS_AWARE_COLOR_PIPE	(1 << 9)
 // Command Streamer chicken bits — GPU preemption granularity control
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gt_regs.h#L342
+#define GEN12_CCS_AUX_INV			(0x4208)
 #define GEN8_CS_CHICKEN1			(0x2580)
 #define   GEN9_PREEMPT_3D_OBJECT_LEVEL		(1 << 0)
 #define   GEN9_PREEMPT_GPGPU_LEVEL(hi, lo)	(((hi) << 2) | ((lo) << 1))
@@ -214,6 +241,11 @@ struct PACKED intel_dmc_header_v3 {
 #define   RING_FORCE_TO_NONPRIV_RANGE_4		(1 << 0)
 #define GEN7_COMMON_SLICE_CHICKEN1		(0x7010)
 #define HIZ_CHICKEN				(0x7018)
+#define   HZ_DEPTH_TEST_LE_GE_OPT_DISABLE	(1 << 13)
+#define COMMON_SLICE_CHICKEN4			(0x7300)
+#define   DISABLE_TDC_LOAD_BALANCING_CALC	(1 << 6)
+#define GEN8_WM_CHICKEN2			(0x5584)
+#define   WAIT_ON_DEPTH_STALL_DONE_DISABLE	(1 << 5)
 #define GEN7_FF_SLICE_CS_CHICKEN1		(0x20e0)
 #define   GEN9_FFSC_PERCTX_PREEMPT_CTRL		(1 << 14)
 #define _PICK_EVEN(__index, __a, __b) ((__a) + (__index) * ((__b) - (__a)))
@@ -323,6 +355,8 @@ struct PACKED intel_dmc_header_v3 {
 #define RING_EIR(base)				((base) + 0xb0)
 #define RING_EMR(base)				((base) + 0xb4)
 #define RING_TAIL(base)				((base) + 0x30)
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_engine_regs.h#L181
+#define RING_CONTEXT_CONTROL(base)		((base) + 0x244)
 #define RING_HEAD(base)				((base) + 0x34)
 #define RING_HWS_PGA(base)			((base) + 0x80)
 #define RING_HWSTAM(base)			((base) + 0x98)
@@ -347,6 +381,7 @@ struct PACKED intel_dmc_header_v3 {
 	(CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT | CTX_CTRL_ENGINE_CTX_SAVE_INHIBIT | CTX_CTRL_INHIBIT_SYN_CTX_SWITCH)
 #define RING_ELSP(base)				((base) + 0x230) /* ExecList Submission Port */
 #define RING_EXECLIST_STATUS(base)	((base) + 0x234)
+#define RING_EXECLIST_STATUS_HI(base) ((base) + 0x238)
 #define RING_CONTEXT_STATUS_PTR(base) ((base) + 0x3a0)
 #define RING_MODE(base)				((base) + 0x29c)
 #define RING_FAULT_REG(base)		((base) + 0x150)
@@ -379,8 +414,13 @@ struct PACKED intel_dmc_header_v3 {
 #define GEN8_GGTT_PTE_BASE		0x800000
 #define GGTT_PTE_LO(page)		(GEN8_GGTT_PTE_BASE + (page) * 8)
 #define GGTT_PTE_HI(page)		(GEN8_GGTT_PTE_BASE + (page) * 8 + 4)
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gtt.h#L100
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gtt.h#L152
+#define GEN12_GGTT_PTE_ADDR_MASK	0x00003FFFFFFFF000ull	/* GENMASK_ULL(45, 12) */
+#define GEN8_PAGE_PRESENT		(1ull << 0)
 #define   GEN11_GFX_DISABLE_LEGACY_MODE		(1 << 3)
 #define   STOP_RING				REG_BIT(8)
+#define   MODE_IDLE				REG_BIT(9)
 // Engine ring base addresses (RCS=render, BCS=blitter, VCS/BSD=video, VECS=video enhance)
 #define RENDER_RING_BASE	0x02000
 #define GEN12_COMPUTE0_RING_BASE	0x1a000
@@ -511,6 +551,8 @@ __typeof(divisor) __d = divisor;			\
 
 #define GEN8_DE_PIPE_ISR_A  (0x44400)
 #define GEN8_DE_PIPE_IMR_A  (0x44404)
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L1398-L1401
+#define  GEN8_PIPE_FIFO_UNDERRUN	REG_BIT(31)
 #define GEN8_DE_PIPE_IIR_A  (0x44408)
 #define GEN8_DE_PIPE_IER_A  (0x4440c)
 
@@ -524,6 +566,30 @@ __typeof(divisor) __d = divisor;			\
 #define GEN8_DE_PIPE_IIR_C  (0x44428)
 #define GEN8_DE_PIPE_IER_C  (0x4442c)
 
+// The gen 6+ fence registers (i915_reg.h) and pipe A's source size (display/intel_display_regs.h):
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/i915_reg.h#L213-L215
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_regs.h#L533-L538
+#define FENCE_REG_GEN6_LO(i)		(0x100000 + (i) * 8)
+#define FENCE_REG_GEN6_HI(i)		(0x100000 + (i) * 8 + 4)
+#define _PIPEASRC		0x6001c
+// A plane's surface base register (display/skl_universal_plane_regs.h) and the plane numbers (display/intel_display_limits.h):
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/intel_display_reg_defs.h#L51-L52
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/skl_universal_plane_regs.h#L11-L16
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/display/skl_universal_plane_regs.h#L153-L160
+enum plane_id { PLANE_1 = 0, PLANE_2, PLANE_3 };
+#define _PIPE(pipe, a, b)		_PICK_EVEN(pipe, a, b)
+#define _PLANE(plane, a, b)		_PICK_EVEN(plane, a, b)
+#define _SKL_PLANE(pipe, plane, reg_1_a, reg_1_b, reg_2_a, reg_2_b) \
+	_PLANE((plane), _PIPE((pipe), (reg_1_a), (reg_1_b)), _PIPE((pipe), (reg_2_a), (reg_2_b)))
+#define _PLANE_SURF_1_A				0x7019c
+#define _PLANE_SURF_2_A				0x7029c
+#define _PLANE_SURF_1_B				0x7119c
+#define _PLANE_SURF_2_B				0x7129c
+#define PLANE_SURF(pipe, plane)		_SKL_PLANE((pipe), (plane), \
+							_PLANE_SURF_1_A, _PLANE_SURF_1_B, \
+							_PLANE_SURF_2_A, _PLANE_SURF_2_B)
+#define   PLANE_SURF_ADDR_MASK			REG_GENMASK(31, 12)
+
 
 
 // ─── GPU frequency / power management ───────────────────────────────────────
@@ -534,6 +600,13 @@ constexpr uint32_t GEN6_RP_STATE_CAP = MCHBAR_MIRROR_BASE_SNB + 0x5998;
 
 constexpr uint32_t GEN9_FREQUENCY_SHIFT = 23;
 constexpr uint32_t GEN9_FREQ_SCALER  = 3;
+// https://github.com/torvalds/linux/blob/65ba8f3/drivers/gpu/drm/i915/gt/intel_gt_regs.h#L777
+#define   GEN9_FREQUENCY(x)			((x) << GEN9_FREQUENCY_SHIFT)
+// From the kernel's include/drm/intel/i915_drm.h: the stolen-memory base of gen 11+ in PCI config space (BDSM, two dwords).
+// https://github.com/torvalds/linux/blob/65ba8f3/include/drm/intel/i915_drm.h#L97-L100
+#define INTEL_GEN11_BSM_DW0	0xc0
+#define INTEL_GEN11_BSM_DW1	0xc4
+#define   INTEL_BSM_MASK	(-(1u << 20))
 
 // ─── Forcewake ──────────────────────────────────────────────────────────────
 // Forcewake keeps GT power domains awake for MMIO access.
@@ -581,6 +654,8 @@ static inline unsigned long find_next_bit(const unsigned long *addr, unsigned lo
 #define __bf_shf(x) (__builtin_ffsll(x) - 1)
 #define REG_FIELD_PREP(__mask, __val) \
 ((uint32_t)((__typeof(__mask))(__val) << __bf_shf(__mask)) & (__mask))
+// The kernel's FIELD_GET (include/linux/bitfield.h) for a constant mask: the field's value, shifted down.
+#define FIELD_GET(_mask, _reg)	(((_reg) & (_mask)) >> __bf_shf(_mask))
 
 // Apple's command streamer type enum (matches IGAccel internal enum)
 enum IGHwCsType
@@ -1370,6 +1445,28 @@ private:
 	
 	// ── Accelerator start & forcewake ──
 	static unsigned long start(void *that,void  *param_1);   // IntelAccelerator::start wrapper
+
+	static void engineProbeTick(thread_call_param_t, thread_call_param_t);
+	static void armEngineProbe(void *accel);
+
+	static void wrapHWCS5RegisterForInterrupts(void *that);
+	mach_vm_address_t oHWCS5RegisterForInterrupts {};
+	mach_vm_address_t oIGSchedEnablePeriodic {};
+
+	static void wrapHWCS5SubmitExecList(void *that, uint32_t flags);
+	mach_vm_address_t oHWCS5SubmitExecList {};
+	static void wrapIdleToActive(void *that, const uint32_t *e);
+	static void wrapPreempted(void *that, const uint32_t *e);
+	static void wrapElementSwitch(void *that, const uint32_t *e);
+	static void wrapActiveToIdle(void *that, const uint32_t *e);
+	static void wrapResetOnWake(void *that);
+	mach_vm_address_t oIdleToActive {}, oPreempted {}, oElementSwitch {}, oActiveToIdle {}, oResetOnWake {};
+
+	static uint64_t wrapEnablePeriodic(void *sched, void *src);
+	mach_vm_address_t oEnablePeriodic {};
+	static uint64_t wrapDisablePeriodic(void *sched, void *src);
+	mach_vm_address_t oDisablePeriodic {};
+
 	static void v54IrqWatchdog(thread_call_param_t, thread_call_param_t);  // V54: IRQ watchdog
 	static void v60GpuHealthMonitor(thread_call_param_t, thread_call_param_t);  // V60: active ERROR_GEN6 suppression + monitor
 	static void v71EmrEnforcer(thread_call_param_t, thread_call_param_t);  // V71: high-freq EMR mask + ERROR clear (50ms)
@@ -1392,11 +1489,15 @@ private:
 	mach_vm_address_t osubmitBlit {};
 	
 	static bool patchRCSCheck(mach_vm_address_t& start);  // bypass RCS engine check
-	static void forceWake(void *that, bool set, uint32_t dom, uint8_t ctx);  // custom forcewake
+	static void forceWake(void *that, bool set, uint32_t dom, uint32_t ctx);  // custom forcewake
 	mach_vm_address_t oforceWake {};
 	static void wrapSafeForceWake(void *that, bool set, uint32_t dom);       // SafeForceWake wrapper
 	mach_vm_address_t oSafeForceWake {};
+
+	static void wrapSafeForceWakeReent(void *that, bool wake, uint32_t domain);
+	mach_vm_address_t oSafeForceWakeReent {};
 	static bool pollRegister(uint32_t reg, uint32_t val, uint32_t mask, uint32_t timeout);
+	static bool pollRegisterFast(uint32_t reg, uint32_t val, uint32_t mask, uint32_t timeoutUs);
 	static bool forceWakeWaitAckFallback(uint32_t reqReg, uint32_t ackReg, uint32_t val, uint32_t mask);
 	
 	static void * serviceInterrupts(void *param_1);  // GT interrupt handler
@@ -1459,6 +1560,11 @@ private:
 	// PAVP = Protected Audio Video Path (DRM session management)
 	static IOReturn wrapPavpSessionCallback(void *intelAccelerator, int32_t sessionCommand, uint32_t sessionAppId, uint32_t *a4, bool flag);
 	mach_vm_address_t orgPavpSessionCallback {};
+	static IOReturn wrapPavpCommandCallbackObj(void *intelAccelerator, OSObject *owner, int32_t sessionCommand, uint32_t sessionAppId, uint32_t *a4);
+	mach_vm_address_t orgPavpCommandCallbackObj {};
+	// PXP resume (i915: intel_pxp_resume_complete) when the framebuffer has no ME client
+	static void wrapWaitForDRMSessionRestore(void *that);
+	static void routePxpResumeComplete(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
 	
 	// CSR = DMC firmware patch data pointers (stepping-specific)
 	const uint8_t *_CSR_PATCH_B0plus;  // B0+ stepping
@@ -1505,7 +1611,14 @@ private:
 	static uint64_t getOSInformation(AppleIntel::AppleIntelBaseController *that);
 	mach_vm_address_t ogetOSInformation {};
 	
-	static uint8_t setDisplayMode(AppleIntel::AppleIntelFramebuffer *that, int param_1, int param_2);
+	static uint64_t tglCreateAppleGraphicsDeviceControlnub(void *that);
+	mach_vm_address_t otglCreateAppleGraphicsDeviceControlnub {};
+
+	static uint64_t metricsLogStub(void *that, uint32_t command, uint32_t a, uint32_t b);
+
+	static uint32_t hwSaveNVRAMStub(void *that);
+
+	static int setDisplayMode(AppleIntel::AppleIntelFramebuffer *that, int param_1, int param_2);
 	mach_vm_address_t osetDisplayMode {};
 	
 	static uint8_t hwRegsNeedUpdate
@@ -1526,12 +1639,23 @@ private:
 	// override the cached optimal to match DDI_BUF_CTL_A instead.
 	static void setupOptimalLaneCount(AppleIntel::AppleIntelBaseController *that, const IODetailedTimingInformationV2 *timing, unsigned int bpp);
 	mach_vm_address_t osetupOptimalLaneCount {};
+	static IOReturn wrapLinkTraining(void *that, void *config);
+	mach_vm_address_t oLinkTraining {};
+	static IOReturn wrapGetDPCDInfo(void *that);
+	mach_vm_address_t oGetDPCDInfo {};
+	static IOReturn wrapSetVoltageSwingAndPreEmphasis(void *that, uint32_t swing, uint32_t preEmphasis,
+	                                                  void *driveConfig);
+	mach_vm_address_t oSetVoltageSwing {};
 
 	// V96: Force display online — WEG's force-online (FOD) hooks getDisplayStatus which
 	// does NOT exist in the TGL framebuffer kext, so it fails with "err 2" at boot.
 	// The TGL FB uses getOnlineInfo instead; hook it here to unconditionally report online.
 	static void getOnlineInfo(AppleIntel::AppleIntelFramebuffer *that, AppleIntel::AppleIntelDisplayPath *displayPath, unsigned char *online, unsigned char *changed);
 	mach_vm_address_t ogetOnlineInfo {};
+
+	static IOReturn fbGetPixelInformation(void *that, int mode, int depth, int aperture, IOPixelInformation *info);
+	mach_vm_address_t ofbGetPixelInformation {};
+	static void routePixelInformation(KernelPatcher &patcher, mach_vm_address_t address, size_t size) __attribute__((noinline));
 
 	// Path B: Force AppleIntelFramebuffer::isApertureMemoryRequired() to return true under
 	// dp0 mode so setupScanoutMemory never migrates from aperture to non-aperture memory
@@ -1552,6 +1676,15 @@ private:
 	
 	static IOReturn wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length);
 	mach_vm_address_t orgICLReadAUX {};
+	static IOReturn wrapICLWriteAUX(void *that, uint32_t address, void *buffer, uint32_t length);
+	mach_vm_address_t orgICLWriteAUX {};
+	static void routeAUXTransactionGuard(KernelPatcher &patcher, mach_vm_address_t address, size_t size) __attribute__((noinline));
+	static void routeEnhancedFraming(KernelPatcher &patcher, mach_vm_address_t address, size_t size) __attribute__((noinline));
+
+	static IOReturn wrapRunAUXCommand(void *that, uint32_t command, uint32_t *data, uint32_t length, bool flag);
+	static IOReturn wrapSetLinkTrainingPattern(void *that, uint32_t pattern);
+	mach_vm_address_t orgRunAUXCommand {};
+	mach_vm_address_t oSetLinkTrainingPattern {};
 	
 	static int blit3d_supported();
 	
@@ -1605,8 +1738,7 @@ private:
 	mach_vm_address_t oparamsSurfCompare {};
 
 	// V402: AppleIntelBaseController::setupDSCEngineParams(AppleIntelFramebuffer *, CRTCParams *, AppleIntelDisplayPath *, IODetailedTimingInformationV2 *)
-	// Read-only diagnostic. Linux confirms DSC=off on our panel; this hook lets us
-	// see if Apple still configures DSC despite Info.plist DSCSupport=0.
+	// Latches the DSC parameters for the VDSC flush.
 	// AppleIntelBaseController::setupDSCEngineParams(AppleIntelFramebuffer*, CRTCParams*, AppleIntelDisplayPath*, IODetailedTimingInformationV2*)
 	static void setupDSCEngineParams(AppleIntel::AppleIntelBaseController *that,
 	                                 AppleIntel::AppleIntelFramebuffer *fb,
@@ -1614,6 +1746,13 @@ private:
 	                                 AppleIntel::AppleIntelDisplayPath *path,
 	                                 IODetailedTimingInformationV2 *timing);
 	mach_vm_address_t osetupDSCEngineParams {};
+
+	static void wrapEnableDSCEngine(AppleIntel::AppleIntelBaseController *that, AppleIntel::AppleIntelFramebuffer *fb,
+	                                AppleIntel::AppleIntelDisplayPath *path);
+	static void wrapDisableDSCEngine(AppleIntel::AppleIntelBaseController *that, AppleIntel::AppleIntelFramebuffer *fb,
+	                                 AppleIntel::AppleIntelDisplayPath *path);
+	mach_vm_address_t oEnableDSCEngine {};
+	mach_vm_address_t oDisableDSCEngine {};
 
 	// V403: AppleIntelBaseController::SetupParams(AppleIntelFramebuffer *, AppleIntelDisplayPath *, CRTCParams *, IODetailedTimingInformationV2 const *)
 	// The MASTER CRTCParams builder — runs once per modeset before any consumer.
@@ -1647,10 +1786,7 @@ private:
 	mach_vm_address_t oConfigureColorPipeLine {};
 
 	// V406: AppleIntelPlane::configurePlane(FlipTransactionArgs*)
-	// Origin-level linear tiling fix: patch FlipTransactionArgs+0x3c tiling enum to 2
-	// (neither X-tiled=0 nor Y-tiled=1) so Apple computes PLANE_CTL bits[12:10]=000
-	// (linear) and PLANE_STRIDE = pitch_bytes/512 = 0x14. Physical pages are CPU-written
-	// linearly; forcing this here ensures the display engine fetches scanlines correctly.
+	// Pass-through with logging (the diagnostic approach selected in kern_gen11.cpp).
 	static void configurePlane(AppleIntel::AppleIntelPlane *that, AppleIntel::FlipTransactionArgs *flipArgs);
 	mach_vm_address_t oConfigurePlane {};
 
@@ -1676,6 +1812,9 @@ private:
 	
 	static void hwSetPowerWellStateAux(AppleIntel::AppleIntelBaseController *that, bool param_1, uint param_2);
 	mach_vm_address_t ohwSetPowerWellStateAux {};
+
+	static IOReturn hwSetBacklight(AppleIntel::AppleIntelBaseController *that, uint32_t level);
+	mach_vm_address_t ohwSetBacklight {};
 	
 	
 	
@@ -1834,6 +1973,13 @@ private:
 	static uint64_t IGHardwareContextinitWithOptions(void *that, void *task, const void *params, uint8_t arg);
 	mach_vm_address_t oIGHardwareContextinitWithOptions {};
 
+	static void wrapContextFree(void *that);
+	mach_vm_address_t oContextFree {};
+
+	static long wrapRenderExecute(uint32_t token, void *queue, void *resList, const void *cmd, void *desc, void *heaps,
+	                              void *accel, void *hwCtx, void *event);
+	mach_vm_address_t oRenderExecute {};
+
 	// Extended GPU context init — sets up additional context state (PPGTT, aux tables)
 	static uint64_t IGHardwareExtendedContextinitWithOptions
 			  (void *that,void *param_1,
@@ -1958,8 +2104,10 @@ private:
 
 	static void applyPreStartEngineWorkarounds(int callCount); // only error/EMR clear — safe before ring init
 	static void applyPreStopEngineWorkarounds(int callCount);  // full GT WAs + BCS drain — before stop only
-	static unsigned long stopGraphicsEngine(void *that);    // V505: dump ring preamble before ring is stopped
+	static bool stopGraphicsEngine(void *that);    // logs the ring preamble before the ring is stopped
 	mach_vm_address_t ostopGraphicsEngine {};
+
+	void routeResolveInit(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) __attribute__((noinline));
 
 	static unsigned long startGraphicsEngine(void *that);  // V163: clear PERCTX_PREEMPT_CTRL before first context snapshot
 	mach_vm_address_t ostartGraphicsEngine {};
@@ -2020,6 +2168,13 @@ public:
 	// Resolved from IOAcceleratorFamily2 by NGreen::processKext — needed by blit3d scratch init.
 	mach_vm_address_t oIOAF2_lockForCPUAccess {};
 	mach_vm_address_t oIOAF2_unlockForCPUAccess {};
+	mach_vm_address_t oIOAF2_getBufferPtrNoInc {};
+	mach_vm_address_t oIOAF2_submitBuffer {};
+	mach_vm_address_t ResolveExtendedCtxParams {};
+	static void wrapPageon(void *that, void *event, bool flag, uint64_t opt);
+	mach_vm_address_t oPageon {};
+	static uint32_t wrapDoHangAnalysis(void *that);
+	mach_vm_address_t oDoHangAnalysis {};
 
 	void init();  // register kextInfos with Lilu
 	static Gen11 *callback;  // singleton for Lilu static callbacks

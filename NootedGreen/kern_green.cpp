@@ -10,6 +10,7 @@
 #include "kern_patcherplus.hpp"
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_devinfo.hpp>
+#include <IOKit/IODeviceTreeSupport.h>
 
 
 static const char *pathIOAcceleratorFamily2= "/System/Library/Extensions/IOAcceleratorFamily2.kext/Contents/MacOS/IOAcceleratorFamily2";
@@ -29,6 +30,17 @@ static KernelPatcher::KextInfo kextIOGraphics { "com.apple.iokit.IOGraphicsFamil
 	KernelPatcher::KextInfo::Unloaded };
 static KernelPatcher::KextInfo kextIOAcceleratorFamily2 { "com.apple.iokit.IOAcceleratorFamily2", &pathIOAcceleratorFamily2, 1, {true}, {},
 	KernelPatcher::KextInfo::Unloaded };
+static const char *pathAppleGraphicsDeviceControl = "/System/Library/Extensions/AppleGraphicsDeviceControl.kext/Contents/MacOS/AppleGraphicsDeviceControl";
+static KernelPatcher::KextInfo kextAppleGraphicsDeviceControl { "com.apple.AppleGraphicsDeviceControl", &pathAppleGraphicsDeviceControl, 1, {true}, {},
+	KernelPatcher::KextInfo::Unloaded };
+
+static const char *pathSandbox = "/System/Library/Extensions/Sandbox.kext/Contents/MacOS/Sandbox";
+static KernelPatcher::KextInfo kextSandbox { "com.apple.security.sandbox", &pathSandbox, 1, {true}, {},
+	KernelPatcher::KextInfo::Unloaded };
+
+static const char *pathAMFI = "/System/Library/Extensions/AppleMobileFileIntegrity.kext/Contents/MacOS/AppleMobileFileIntegrity";
+static KernelPatcher::KextInfo kextAMFI { "com.apple.driver.AppleMobileFileIntegrity", &pathAMFI, 1, {true}, {},
+	KernelPatcher::KextInfo::Unloaded };
 
 NGreen *NGreen::callback = nullptr;
 
@@ -36,6 +48,57 @@ static Genx genx;
 static Gen11 gen11;
 static DYLDPatches dyldpatches;
 static HDMI agfxhda;
+
+extern uint8_t *gIOFBVerbosePtr, *gIOFBBlackPtr;
+extern mach_vm_address_t gOrgInitFB;
+extern volatile uint32_t gBootFillRouted;
+void wrapInitFB(void *fb);
+
+static uint8_t *flagFromCmp(mach_vm_address_t fn, uint32_t off) {
+	if (fn == 0) return nullptr;
+	const uint8_t *p = reinterpret_cast<const uint8_t *>(fn + off);
+	if (p[0] != 0x80 || p[1] != 0x3d || p[6] != 0x00) return nullptr;
+	int32_t rel = 0;
+	lilu_os_memcpy(&rel, p + 2, sizeof(rel));
+	return reinterpret_cast<uint8_t *>(fn + off + 7 + static_cast<int64_t>(rel));
+}
+
+static void __attribute__((noinline)) routeBootFill(KernelPatcher &patcher, size_t index, mach_vm_address_t address,
+                                                 size_t size) {
+	const mach_vm_address_t initFB = patcher.solveSymbol(index, "__ZN13IOFramebuffer6initFBEv");
+	if (initFB == 0) patcher.clearError();
+	const mach_vm_address_t bootFill = patcher.solveSymbol(index, "__ZL23IOFramebufferBootInitFByjjjjh");
+	if (bootFill == 0) patcher.clearError();
+	const bool inText = initFB >= address && initFB + 0x2c3 <= address + size && bootFill >= address
+	                    && bootFill + 0x2e <= address + size;
+	uint8_t *vp = inText ? flagFromCmp(initFB, 0x2bc) : nullptr;
+	uint8_t *bp = inText ? flagFromCmp(bootFill, 0x27) : nullptr;
+	uint32_t mask = 0;
+	if (vp != nullptr) mask |= 1u << 1;
+	if (bp != nullptr) mask |= 1u << 2;
+	gIOFBVerbosePtr = vp;
+	gIOFBBlackPtr = bp;
+	RouteRequestPlus req[] = {
+		{"__ZN13IOFramebuffer6initFBEv", wrapInitFB, gOrgInitFB},
+	};
+	if (RouteRequestPlus::routeAll(patcher, index, req, address, size)) mask |= 1u << 0;
+	else patcher.clearError();
+	__sync_fetch_and_or(&gBootFillRouted, mask);
+}
+
+static void __attribute__((noinline)) patchIOGraphics(KernelPatcher &patcher, size_t index,
+                                                           mach_vm_address_t address, size_t size) {
+	static const uint8_t fbStartFind[]    = {0x48, 0x85, 0xc0, 0x74, 0x5b, 0x48, 0x8b, 0x3d, 0x1d, 0xac, 0x02, 0x00};
+	static const uint8_t fbStartMask[]    = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+	static const uint8_t fbStartReplace[] = {0x48, 0x85, 0xc0, 0x90, 0x90, 0x48, 0x8b, 0x3d, 0x1d, 0xac, 0x02, 0x00};
+	static const uint8_t fbStartReplMask[]= {0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+	const LookupPatchPlus fbStartPatch {&kextIOGraphics, fbStartFind, fbStartMask,
+		fbStartReplace, fbStartReplMask, 1};
+	fbStartPatch.apply(patcher, address, size);
+	patcher.clearError();
+
+	routeBootFill(patcher, index, address, size);
+}
 
 static uint8_t builtin2[] = {0x00, 0x00, 0x49, 0x9A};
 static uint8_t builtin3[] = {0x49, 0x9A, 0x00, 0x00};
@@ -147,11 +210,16 @@ static void seedIGPUPropertiesEarly() {
 void NGreen::init() {
     callback = this;
 	
+	mmioLock = IOSimpleLockAlloc();
+
 	lilu.onKextLoadForce(&kextAGDP);
-	/*lilu.onKextLoadForce(&kextBacklight);
-	lilu.onKextLoadForce(&kextMCCSControl);
-	lilu.onKextLoadForce(&kextIOGraphics);*/
+	lilu.onKextLoadForce(&kextBacklight);
+	/*lilu.onKextLoadForce(&kextMCCSControl);*/
+	lilu.onKextLoadForce(&kextIOGraphics);
 	lilu.onKextLoadForce(&kextIOAcceleratorFamily2);
+	lilu.onKextLoadForce(&kextAppleGraphicsDeviceControl);
+	lilu.onKextLoadForce(&kextSandbox);
+	lilu.onKextLoadForce(&kextAMFI);
 	
 	genx.init();
 	gen11.init();
@@ -171,6 +239,18 @@ void NGreen::init() {
 
 
 void NGreen::processPatcher(KernelPatcher &patcher) {
+	if (!orgVnGetPath) {
+		orgVnGetPath = reinterpret_cast<int (*)(void *, char *, int *)>(
+			patcher.solveSymbol(KernelPatcher::KernelID, "_vn_getpath"));
+		patcher.clearError();
+	}
+
+	if (!orgFgGetVnode) {
+		orgFgGetVnode = reinterpret_cast<void *(*)(void *)>(
+			patcher.solveSymbol(KernelPatcher::KernelID, "_fg_get_vnode"));
+		patcher.clearError();
+	}
+
 	// Hook _cs_validate_page FIRST — before DeviceInfo which blocks
 	// for >60s polling PEGP (NVIDIA dGPU) disable via processSwitchOff.
 	// Without this, WindowServer starts before the hook is established
@@ -265,6 +345,26 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
             SYSLOG("ngreen", "V52: CPU family=0x%x model=0x%x stepping=%u isRealTGL=%d",
                    family, model, stepping, this->isRealTGL);
         }
+
+        // AppleGVA's AVDGetGPUAccelerators switches on the DT root's hwgva-id (the key its "board-id" read becomes under the DYLD
+        // patch). For iMacPro1,1, the value DYLDPatches publishes early, it keeps an AMD accelerator or none, so the Intel VA plug-in
+        // is never created and every hardware decode ends in "Error loading GPU renderer". Any board outside its three iMac Pro /
+        // Mac Pro cases takes the Intel path: on Raptor Lake-HX the root's own board-id (the SMBIOS one) is published instead.
+        // AppleGVA's and AppleVPA's per-board plist entries follow the same key.
+        if (isRaptorLakeHX()) {
+            auto *root = IORegistryEntry::fromPath("/", gIODTPlane);
+            if (root != nullptr) {
+                auto *boardId = OSDynamicCast(OSData, root->getProperty("board-id"));
+                if (boardId != nullptr) {
+                    root->setProperty("hwgva-id", boardId);
+                    SYSLOG("ngreen", "hwgva-id set to the board-id %.*s: AppleGVA's board switch takes the Intel path",
+                           static_cast<int>(boardId->getLength()), static_cast<const char *>(boardId->getBytesNoCopy()));
+                } else {
+                    SYSLOG("ngreen", "hwgva-id left as iMacPro1,1: no board-id on the DT root");
+                }
+                OSSafeReleaseNULL(root);
+            }
+        }
 		
 		auto gms = WIOKit::readPCIConfigValue(devInfo->videoBuiltin, WIOKit::kIOPCIConfigGraphicsControl, 0, 16) >> 8;
 		
@@ -330,7 +430,11 @@ bool NGreen::wrapIGAccelDeviceStart(void *that) {
 void NGreen::setRMMIOIfNecessary() {
 	if (UNLIKELY(!this->rmmio || !this->rmmio->getLength())) {
 		this->rmmio = this->iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+		if (this->rmmio && this->rmmio->getLength() >= (mmPCIE_DATA2 + 1) * sizeof(uint32_t)) {
 		this->rmmioPtr = reinterpret_cast<volatile uint32_t *>(this->rmmio->getVirtualAddress());
+		} else {
+			this->rmmioPtr = nullptr;
+		}
 	}
 }
 
@@ -481,13 +585,58 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			SYSLOG("ngreen", "V500: set_id_mode hook FAILED — symbol not found");
 		}
 
-	}  else if (kextIOGraphics.loadIndex == index) {
-		/*
-		KernelPatcher::RouteRequest requests[] = {
-				{"__ZN13IOFramebuffer25extValidateDetailedTimingEP8OSObjectPvP25IOExternalMethodArguments", wrapValidateDetailedTiming},
+		if (Gen11::callback) {
+			SolveRequestPlus resolvePoolSolve[] = {
+				{"__ZN25IOAccelCommandBufferPool217getBufferPtrNoIncEj", Gen11::callback->oIOAF2_getBufferPtrNoInc},
 			};
-			patcher.routeMultiple(index, requests, address, size);
-			patcher.clearError();*/
+			if (!SolveRequestPlus::solveAll(patcher, index, resolvePoolSolve, address, size))
+				patcher.clearError();
+		}
+
+		if (Gen11::callback) {
+			SolveRequestPlus blit3dInitSolve[] = {
+				{"__ZN25IOAccelCommandBufferPool212submitBufferEv", Gen11::callback->oIOAF2_submitBuffer},
+			};
+			if (!SolveRequestPlus::solveAll(patcher, index, blit3dInitSolve, address, size))
+				patcher.clearError();
+		}
+	}  else if (kextAppleGraphicsDeviceControl.loadIndex == index) {
+		static const uint8_t wrangler_wait_f[]  = {0xc4, 0x48, 0x89, 0xc7, 0x48, 0xc7, 0xc6, 0xff, 0xff, 0xff, 0xff, 0xe8};
+		static const uint8_t wrangler_wait_m[]  = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+		static const uint8_t wrangler_wait_r[]  = {0xc4, 0x48, 0x89, 0xc7, 0x48, 0xc7, 0xc6, 0x00, 0x94, 0x35, 0x77, 0xe8};
+		static const uint8_t wrangler_wait_rm[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+		const LookupPatchPlus wranglerWaitPatch {&kextAppleGraphicsDeviceControl, wrangler_wait_f, wrangler_wait_m,
+			wrangler_wait_r, wrangler_wait_rm, 1};
+		wranglerWaitPatch.apply(patcher, address, size);
+		patcher.clearError();
+
+		static const uint8_t agdcLock_f[]  = {0x48, 0x8b, 0x3d, 0x77, 0x4c, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x3d, 0x7b, 0x50, 0x00, 0x00};
+		static const uint8_t agdcLock_m[]  = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+		static const uint8_t agdcLock_r[]  = {0x48, 0x8b, 0x3d, 0x77, 0x4c, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x48, 0x8d, 0x3d, 0x7b, 0x50, 0x00, 0x00};
+		static const uint8_t agdcLock_rm[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+		static const uint8_t agdcUnlock_f[]  = {0x48, 0x8b, 0x3d, 0x32, 0x4c, 0x00, 0x00, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x05, 0x3e, 0x23, 0x00, 0x00};
+		static const uint8_t agdcUnlock_m[]  = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+		static const uint8_t agdcUnlock_r[]  = {0x48, 0x8b, 0x3d, 0x32, 0x4c, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x48, 0x8b, 0x05, 0x3e, 0x23, 0x00, 0x00};
+		static const uint8_t agdcUnlock_rm[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+		const LookupPatchPlus agdcLockPatch {&kextAppleGraphicsDeviceControl, agdcLock_f, agdcLock_m,
+			agdcLock_r, agdcLock_rm, 1};
+		const LookupPatchPlus agdcUnlockPatch {&kextAppleGraphicsDeviceControl, agdcUnlock_f, agdcUnlock_m,
+			agdcUnlock_r, agdcUnlock_rm, 1};
+		agdcLockPatch.apply(patcher, address, size);
+		patcher.clearError();
+		agdcUnlockPatch.apply(patcher, address, size);
+		patcher.clearError();
+
+		static const uint8_t agdcRegSvc_f[]  = {0x4c, 0x89, 0xff, 0x31, 0xf6, 0xff, 0x90, 0xb0, 0x05, 0x00, 0x00, 0x48, 0x8b, 0x05};
+		static const uint8_t agdcRegSvc_m[]  = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+		static const uint8_t agdcRegSvc_r[]  = {0x4c, 0x89, 0xff, 0x31, 0xf6, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x48, 0x8b, 0x05};
+		static const uint8_t agdcRegSvc_rm[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00};
+		const LookupPatchPlus agdcRegSvcPatch {&kextAppleGraphicsDeviceControl, agdcRegSvc_f, agdcRegSvc_m,
+			agdcRegSvc_r, agdcRegSvc_rm, 1};
+		agdcRegSvcPatch.apply(patcher, address, size);
+		patcher.clearError();
+	}  else if (kextIOGraphics.loadIndex == index) {
+		patchIOGraphics(patcher, index, address, size);
 		
 	}  else if (kextAGDP.loadIndex == index) {
 		const LookupPatchPlus patch {&kextAGDP, kAGDPBoardIDKeyOriginal, kAGDPBoardIDKeyPatched, 1};
@@ -502,8 +651,8 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			SYSLOG_COND(!patch.apply(patcher, address, size), "NGreen", "Failed to apply AGDP fb count check patch");
 		}*/
 	}  else if (kextBacklight.loadIndex == index) {
-		// V204b: re-enable AppleIntelPanel::setDisplay route + backlight string patch.
-		// Friend's working version has these enabled. Sets up panel data for backlight ramp.
+		// AppleIntelPanel::setDisplay has no table for a panel Apple does not list: its "Default" entry fails the call
+		// and the display gets no brightness parameter. Add WhateverGreen's tables, looked up as F<_UID>Txxxx.
 		KernelPatcher::RouteRequest request {"__ZN15AppleIntelPanel10setDisplayEP9IODisplay", wrapApplePanelSetDisplay,
 			orgApplePanelSetDisplay};
 		if (patcher.routeMultiple(kextBacklight.loadIndex, &request, 1, address, size)) {
@@ -519,6 +668,17 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			};
 			patcher.routeMultiple(index, requests, address, size);
 			patcher.clearError();*/
+} else if (kextSandbox.loadIndex == index) {
+		KernelPatcher::RouteRequest request {"_sb_evaluate_internal", wrapSbEvaluateInternal,
+			orgSbEvaluateInternal};
+		if (!patcher.routeMultiple(index, &request, 1, address, size))
+			patcher.clearError();
+} else if (kextAMFI.loadIndex == index) {
+		KernelPatcher::RouteRequest request {
+			"__Z30_file_check_library_validationP4procP8fileglobxxm",
+			wrapFileCheckLibraryValidation, orgFileCheckLibraryValidation};
+		if (!patcher.routeMultiple(index, &request, 1, address, size))
+			patcher.clearError();
 } else if (genx.processKext(patcher, index, address, size)) {
 	DBGLOG("ngreen", "Processed Generation x configuration");
 } else if (gen11.processKext(patcher, index, address, size)) {
@@ -529,7 +689,43 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
     return true;
 }
 
+bool NGreen::isUnderGpuBundles(void *vp) {
+	if (!callback || !callback->orgVnGetPath || !vp) return false;
+	static const char kPrefix[] = "/Library/GPUBundles";
+	char buf[1024];
+	int len = static_cast<int>(sizeof(buf));
+	int err = callback->orgVnGetPath(vp, buf, &len);
+	if (err != 0) return false;
+	for (size_t i = 0; i < sizeof(kPrefix) - 1; i++) {
+		if (buf[i] != kPrefix[i]) return false;
+	}
+	char nb = buf[sizeof(kPrefix) - 1];
+	return nb == '\0' || nb == '/';
+}
 
+uint64_t NGreen::wrapSbEvaluateInternal(void *label, uint32_t operation, void *context, void *block) {
+	uint64_t r = FunctionCast(wrapSbEvaluateInternal, callback->orgSbEvaluateInternal)(label, operation, context, block);
+	if (static_cast<uint32_t>(r) == 0 || context == nullptr) return r;
+	if (operation != 0x11 && operation != 0x16 && operation != 0x17) return r;
+	constexpr size_t kSbCtxTypeOff  = 0x0;
+	constexpr size_t kSbCtxVnodeOff = 0xC8;
+	uint32_t ctxType = *reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(context) + kSbCtxTypeOff);
+	if (ctxType != 1) return r;
+	void *vp = *reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(context) + kSbCtxVnodeOff);
+	if (!isUnderGpuBundles(vp)) return r;
+	return 0;
+}
+
+int NGreen::wrapFileCheckLibraryValidation(void *proc, void *fileglob, uint64_t sliceOffset,
+		uint64_t errMsg, uint64_t errMsgSize) {
+	int r = FunctionCast(wrapFileCheckLibraryValidation, callback->orgFileCheckLibraryValidation)(
+		proc, fileglob, sliceOffset, errMsg, errMsgSize);
+	if (r == 0 || fileglob == nullptr) return r;
+	if (!callback->orgFgGetVnode) return r;
+	void *vp = callback->orgFgGetVnode(fileglob);
+	if (!isUnderGpuBundles(vp)) return r;
+	return 0;
+}
 
 uint16_t NGreen::configRead16(IORegistryEntry *service, uint32_t space, uint8_t offset) {
 	if (callback && callback->orgConfigRead16) {
@@ -629,6 +825,15 @@ bool NGreen::wrapApplePanelSetDisplay(IOService *that, IODisplay *display) {
 	}
 
 	bool ret = FunctionCast(wrapApplePanelSetDisplay, callback->orgApplePanelSetDisplay)(that, display);
+	static int rows = 0;
+	if (rows++ < 4) {
+		auto *panel = OSDynamicCast(OSDictionary, that->getProperty("ApplePanel"));
+		auto *iter = panel ? OSCollectionIterator::withCollection(panel) : nullptr;
+		auto *key = iter ? OSDynamicCast(OSSymbol, iter->getNextObject()) : nullptr;
+		SYSLOG("ngreen", "AppleIntelPanel::setDisplay: %s, panel table %s", ret ? "true" : "false",
+			key ? key->getCStringNoCopy() : "none");
+		OSSafeReleaseNULL(iter);
+	}
 	return ret;
 }
 
